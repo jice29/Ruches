@@ -8,25 +8,33 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
       :root {
-        --bg: #f4f1e9;
-        --card: #fffdf7;
-        --ink: #1f1f1b;
-        --muted: #6a685f;
-        --accent: #b66c2f;
-        --accent2: #2f6b5b;
-        --line: #e1dac8;
-        --warn: #9b2f1f;
+        --bg: #fff7dd;
+        --card: #ffffff;
+        --ink: #2a1f10;
+        --muted: #6b5d4c;
+        --accent: #f2a900;
+        --accent2: #00a884;
+        --line: #efd59a;
+        --warn: #ba2d0b;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
         font-family: "Segoe UI", Tahoma, sans-serif;
         color: var(--ink);
-        background: radial-gradient(circle at top right, #f7efd8, var(--bg) 40%);
+        background:
+          radial-gradient(circle at 10% 10%, #fff3b0 0%, transparent 36%),
+          radial-gradient(circle at 90% 5%, #b7f5dd 0%, transparent 28%),
+          linear-gradient(135deg, #fff8e8 0%, var(--bg) 100%);
       }
       .wrap { max-width: 1150px; margin: 20px auto; padding: 0 14px; }
       .head {
-        display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+        display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      }
+      .title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
       h1 { margin: 0; font-size: 28px; letter-spacing: .3px; }
       .status { color: var(--muted); font-size: 14px; }
@@ -46,7 +54,8 @@
       }
       .controls button.active {
         border-color: var(--accent);
-        color: var(--accent);
+        color: #6a3f00;
+        background: #ffe8ad;
         font-weight: 600;
       }
       .alert {
@@ -68,21 +77,47 @@
         border: 1px solid var(--line);
         border-radius: 12px;
         padding: 12px;
+        box-shadow: 0 6px 18px rgba(157, 127, 46, 0.08);
       }
       .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
-      .val { margin-top: 6px; font-size: 30px; font-weight: 700; line-height: 1; }
+      .val {
+        margin-top: 6px;
+        font-size: 30px;
+        font-weight: 700;
+        line-height: 1;
+        color: #7a4d00;
+      }
       .charts {
         margin-top: 12px; display: grid; gap: 10px;
         grid-template-columns: 1fr;
       }
       canvas { width: 100%; height: 220px; }
       .raw { margin-top: 10px; color: var(--muted); font-size: 13px; word-break: break-all; }
+      .bee {
+        width: 28px;
+        height: 28px;
+        display: inline-block;
+      }
     </style>
   </head>
   <body>
     <div class="wrap">
       <div class="head">
-        <h1>Ruche Live</h1>
+        <div class="title">
+          <svg class="bee" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-label="Abeille">
+            <ellipse cx="21" cy="16" rx="10" ry="7" fill="#d7f5ff"/>
+            <ellipse cx="43" cy="16" rx="10" ry="7" fill="#d7f5ff"/>
+            <ellipse cx="32" cy="35" rx="17" ry="13" fill="#f2a900"/>
+            <rect x="20" y="29" width="24" height="3" fill="#2a1f10"/>
+            <rect x="18" y="35" width="28" height="3" fill="#2a1f10"/>
+            <rect x="20" y="41" width="24" height="3" fill="#2a1f10"/>
+            <circle cx="25" cy="31" r="2" fill="#2a1f10"/>
+            <circle cx="39" cy="31" r="2" fill="#2a1f10"/>
+            <line x1="24" y1="23" x2="19" y2="17" stroke="#2a1f10" stroke-width="2" />
+            <line x1="40" y1="23" x2="45" y2="17" stroke="#2a1f10" stroke-width="2" />
+          </svg>
+          <h1>Ruche Live</h1>
+        </div>
         <div class="status" id="status">En attente...</div>
       </div>
 
