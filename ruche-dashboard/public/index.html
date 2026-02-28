@@ -137,7 +137,7 @@
         });
       }
 
-      const cw = mkChart("cw", "Poids (g)", "#b66c2f", 0, 100000);
+      const cw = mkChart("cw", "Poids (kg)", "#b66c2f", 0, 100);
       const ct = mkChart("ct", "Temp (C)", "#2f6b5b", -10, 60);
       const ch = mkChart("ch", "Hum (%)", "#325e88", 0, 100);
 
@@ -159,7 +159,8 @@
       function updateKpis(last) {
         if (!last) return;
         $("status").textContent = `Dernier paquet: ${last.packet ?? "-"} | ${new Date(last.ts).toLocaleTimeString()}`;
-        $("w").textContent = `${Math.round(last.weight_g)} g`;
+        const weightKg = (Number(last.weight_g) || 0) / 1000.0;
+        $("w").textContent = `${weightKg.toFixed(3)} kg`;
         $("t").textContent = last.temp_c == null ? "--" : `${Math.round(last.temp_c)} C`;
         $("h").textContent = last.hum_pct == null ? "--" : `${Math.round(last.hum_pct)} %`;
         $("b").textContent = last.batt_pct == null ? "--" : `${Math.round(last.batt_pct)} %`;
@@ -190,7 +191,7 @@
         rows.forEach((row) => {
           const x = new Date(row.ts).toLocaleTimeString();
           cw.data.labels.push(x);
-          cw.data.datasets[0].data.push(row.weight_g);
+          cw.data.datasets[0].data.push((Number(row.weight_g) || 0) / 1000.0);
           if (row.temp_c != null) {
             ct.data.labels.push(x);
             ct.data.datasets[0].data.push(row.temp_c);
@@ -220,13 +221,13 @@
 
       function exportCsv() {
         const rows = getVisibleRows();
-        const header = ["ts","packet","weight_g","temp_c","hum_pct","batt_pct","rssi","alert_signal_lost","alert_batt_low","raw"];
+        const header = ["ts","packet","weight_kg","temp_c","hum_pct","batt_pct","rssi","alert_signal_lost","alert_batt_low","raw"];
         const lines = [header.join(",")];
         rows.forEach((r) => {
           const vals = [
             r.ts,
             r.packet ?? "",
-            r.weight_g ?? "",
+            ((Number(r.weight_g) || 0) / 1000.0).toFixed(3),
             r.temp_c ?? "",
             r.hum_pct ?? "",
             r.batt_pct ?? "",
