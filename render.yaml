@@ -5,9 +5,15 @@ services:
     rootDir: ruche-dashboard
     buildCommand: npm install
     startCommand: node server.js
-    healthCheckPath: /api/status
+    healthCheckPath: /healthz
     envVars:
       - key: MQTT_URL
         value: mqtt://broker.hivemq.com:1883
       - key: MQTT_TOPIC
         value: ruches/telemetry
+      - key: DASH_USER
+        sync: false
+      - key: DASH_PASS
+        sync: false
+      - key: HISTORY_LIMIT
+        value: "2000"
