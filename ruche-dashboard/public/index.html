@@ -87,10 +87,10 @@
       </div>
 
       <div class="controls">
-        <button data-range="15m">15m</button>
-        <button data-range="1h" class="active">1h</button>
-        <button data-range="6h">6h</button>
-        <button data-range="24h">24h</button>
+        <button data-range="1d" class="active">1J</button>
+        <button data-range="1w">1sem</button>
+        <button data-range="1m">1mois</button>
+        <button data-range="6m">6 mois</button>
         <button data-range="all">Tout</button>
         <button id="exportCsv">Export CSV</button>
       </div>
@@ -118,7 +118,7 @@
       const socket = io();
       const $ = (id) => document.getElementById(id);
       const MAX_POINTS = 5000;
-      let selectedRange = "1h";
+      let selectedRange = "1d";
       const allRows = [];
 
       function mkChart(id, label, color, yMin = null, yMax = null) {
@@ -142,10 +142,10 @@
       const ch = mkChart("ch", "Hum (%)", "#325e88", 0, 100);
 
       function rangeToMs(key) {
-        if (key === "15m") return 15 * 60 * 1000;
-        if (key === "1h") return 60 * 60 * 1000;
-        if (key === "6h") return 6 * 60 * 60 * 1000;
-        if (key === "24h") return 24 * 60 * 60 * 1000;
+        if (key === "1d") return 24 * 60 * 60 * 1000;
+        if (key === "1w") return 7 * 24 * 60 * 60 * 1000;
+        if (key === "1m") return 30 * 24 * 60 * 60 * 1000;
+        if (key === "6m") return 180 * 24 * 60 * 60 * 1000;
         return null;
       }
 
