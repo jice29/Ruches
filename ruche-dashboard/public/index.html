@@ -350,6 +350,10 @@
       $("exportCsv").addEventListener("click", exportCsv);
       $("cmdTare").addEventListener("click", async () => {
         const box = $("cmdStatus");
+        if (!window.confirm("Confirmer la TARE a distance ?")) {
+          box.textContent = "Tare annulee";
+          return;
+        }
         box.textContent = "Envoi TARE...";
         try {
           const out = await sendCommand({ action: "tare" });
@@ -363,6 +367,10 @@
         const mass = Number($("calMass").value);
         if (!Number.isFinite(mass) || mass <= 0) {
           box.textContent = "Saisir une masse > 0";
+          return;
+        }
+        if (!window.confirm(`Confirmer le calibrage avec ${mass.toFixed(2)} g ?`)) {
+          box.textContent = "Calibrage annule";
           return;
         }
         box.textContent = `Envoi CAL:${mass.toFixed(2)}...`;
