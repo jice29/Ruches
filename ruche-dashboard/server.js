@@ -6,7 +6,7 @@ const path = require("path");
 const mqtt = require("mqtt");
 const { Server } = require("socket.io");
 
-const HTTPS_PORT = Number(process.env.HTTPS_PORT || process.env.HTTP_PORT || 8090);
+const HTTPS_PORT = Number(process.env.PORT || process.env.HTTPS_PORT || process.env.HTTP_PORT || 8090);
 const REDIRECT_HTTP_PORT = Number(process.env.REDIRECT_HTTP_PORT || 8080);
 const TLS_PFX_PATH = process.env.TLS_PFX_PATH || path.join(__dirname, "cert", "ruche-dashboard.pfx");
 const TLS_PFX_PASSPHRASE = process.env.TLS_PFX_PASSPHRASE || "ruche-dashboard";
@@ -59,7 +59,7 @@ function sanitizeTelemetry(payload) {
   const temp = Number(payload.temp_c);
   const hum = Number(payload.hum_pct);
   const batt = Number(payload.batt_pct);
-  const rssi = Number(payload.rssi);
+  const rssi = Number(payload.rssi_dbm ?? payload.rssi);
   const packet = Number(payload.packet);
 
   if (!Number.isFinite(weight)) return null;
