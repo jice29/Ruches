@@ -15,6 +15,7 @@ const TLS_PFX_PASSPHRASE = process.env.TLS_PFX_PASSPHRASE || "ruche-dashboard";
 const MQTT_URL = process.env.MQTT_URL || "mqtt://broker.hivemq.com:1883";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "ruches/telemetry";
 const MQTT_TOPIC_COMMAND = process.env.MQTT_TOPIC_COMMAND || "ruches/command";
+const MQTT_TOPIC_ACK = process.env.MQTT_TOPIC_ACK || "ruches/ack";
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 2000);
 const DB_PATH = process.env.SQLITE_PATH || path.join(__dirname, "data", "history.sqlite3");
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -65,8 +66,10 @@ app.get("/api/status", (_req, res) => {
     mqtt_url: MQTT_URL,
     topic: MQTT_TOPIC,
     topic_command: MQTT_TOPIC_COMMAND,
+    topic_ack: MQTT_TOPIC_ACK,
     db_backend: usePostgres ? "postgres" : "sqlite",
     last: state.last,
+    last_ack: state.lastAck,
     history_len: state.history.length,
   });
 });
@@ -109,6 +112,7 @@ app.get("/api/history", (_req, res) => {
 const state = {
   last: null,
   history: [],
+  lastAck: null,
 };
 
 function isAuthorized(authHeader) {
@@ -295,13 +299,29 @@ mqttClient.on("connect", () => {
       console.log(`[MQTT] Abonne: ${MQTT_TOPIC}`);
     }
   });
+  mqttClient.subscribe(MQTT_TOPIC_ACK, (err) => {
+    if (err) {
+      console.error("[MQTT] Erreur subscribe ACK:", err.message);
+    } else {
+      console.log(`[MQTT] Abonne: ${MQTT_TOPIC_ACK}`);
+    }
+  });
 });
 
 mqttClient.on("error", (err) => {
   console.error("[MQTT] Erreur:", err.message);
 });
 
-mqttClient.on("message", (_topic, buffer) => {
+mqttClient.on("message", (topic, buffer) => {
+  if (topic === MQTT_TOPIC_ACK) {
+    state.lastAck = {
+      ts: nowIso(),
+      payload: buffer.toString("utf8"),
+    };
+    io.emit("ack", state.lastAck);
+    return;
+  }
+
   let payload;
   try {
     payload = JSON.parse(buffer.toString("utf8"));
@@ -327,6 +347,7 @@ io.on("connection", (socket) => {
   socket.emit("bootstrap", {
     last: state.last,
     history: state.history,
+    last_ack: state.lastAck,
   });
 });
 

@@ -193,8 +193,10 @@
       const socket = io();
       const $ = (id) => document.getElementById(id);
       const MAX_POINTS = 5000;
+      const STALE_FLOW_MS = 120000;
       let selectedRange = "1d";
       const allRows = [];
+      let lastAck = null;
 
       function mkChart(id, label, color, yMin = null, yMax = null) {
         return new Chart($(id), {
@@ -232,8 +234,15 @@
       }
 
       function updateKpis(last) {
-        if (!last) return;
-        $("status").textContent = `Dernier paquet: ${last.packet ?? "-"} | ${new Date(last.ts).toLocaleTimeString()}`;
+        if (!last) {
+          $("status").textContent = "Aucune mesure";
+          $("alertBox").style.display = "block";
+          $("alertBox").textContent = "Alerte: flux de mesures indisponible";
+          return;
+        }
+        const lastMs = new Date(last.ts).getTime();
+        const ageSec = Number.isFinite(lastMs) ? Math.floor((Date.now() - lastMs) / 1000) : -1;
+        $("status").textContent = `Dernier paquet: ${last.packet ?? "-"} | ${new Date(last.ts).toLocaleTimeString()} | age ${ageSec}s`;
         const weightKg = (Number(last.weight_g) || 0) / 1000.0;
         $("w").textContent = `${weightKg.toFixed(3)} kg`;
         $("t").textContent = last.temp_c == null ? "--" : `${Math.round(last.temp_c)} C`;
@@ -243,6 +252,9 @@
         $("raw").textContent = `Trame: ${last.raw || "-"}`;
 
         const alerts = [];
+        if (Number.isFinite(lastMs) && (Date.now() - lastMs) > STALE_FLOW_MS) {
+          alerts.push("Flux bloque > 2 min");
+        }
         if (last.alert_signal_lost === 1 || last.alert_signal_lost === true) alerts.push("Signal LoRa perdu");
         if (last.alert_batt_low === 1 || last.alert_batt_low === true) alerts.push("Batterie faible");
         const box = $("alertBox");
@@ -287,6 +299,11 @@
         const last = allRows.length ? allRows[allRows.length - 1] : null;
         updateKpis(last);
         drawFromRows(visible);
+      }
+
+      function renderAck() {
+        if (!lastAck || !lastAck.payload) return;
+        $("cmdStatus").textContent = `ACK ${new Date(lastAck.ts).toLocaleTimeString()} : ${lastAck.payload}`;
       }
 
       function addRow(row) {
@@ -390,7 +407,13 @@
           const hist = (payload && payload.history) || [];
           allRows.length = 0;
           hist.forEach((row) => addRow(row));
+          const st = await fetch("/api/status", { cache: "no-store" });
+          if (st.ok) {
+            const s = await st.json();
+            if (s && s.last_ack) lastAck = s.last_ack;
+          }
           render();
+          renderAck();
         } catch (_e) {}
       }
 
@@ -398,7 +421,9 @@
         const hist = (payload && payload.history) || [];
         allRows.length = 0;
         hist.forEach((row) => addRow(row));
+        if (payload && payload.last_ack) lastAck = payload.last_ack;
         render();
+        renderAck();
       });
 
       socket.on("telemetry", (row) => {
@@ -406,11 +431,17 @@
         render();
       });
 
+      socket.on("ack", (ack) => {
+        lastAck = ack;
+        renderAck();
+      });
+
       socket.on("connect_error", () => {
         bootstrapFromHttp();
       });
 
       bootstrapFromHttp();
+      setInterval(render, 5000);
     </script>
   </body>
 </html>
