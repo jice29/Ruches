@@ -44,6 +44,31 @@
         gap: 8px;
         flex-wrap: wrap;
       }
+      .tabbar {
+        margin-top: 10px;
+        display: flex;
+        gap: 8px;
+      }
+      .tabbtn {
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        border-radius: 10px;
+        padding: 7px 12px;
+        cursor: pointer;
+      }
+      .tabbtn.active {
+        border-color: var(--accent2);
+        background: #f1e8ff;
+        color: #3f246f;
+        font-weight: 600;
+      }
+      .tabpanel {
+        display: none;
+      }
+      .tabpanel.active {
+        display: block;
+      }
       .controls button {
         border: 1px solid var(--line);
         background: var(--card);
@@ -121,6 +146,18 @@
         color: var(--muted);
         font-size: 13px;
       }
+      .techgrid {
+        margin-top: 10px;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      }
+      .mono {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 13px;
+        color: #3a2a19;
+        word-break: break-word;
+      }
       .bee {
         width: 28px;
         height: 28px;
@@ -163,30 +200,46 @@
         <button id="exportCsv">Export CSV</button>
       </div>
 
-      <div class="alert" id="alertBox"></div>
-
-      <div class="kpis">
-        <div class="card"><div class="label">Poids</div><div class="val" id="w">--</div></div>
-        <div class="card"><div class="label">Temperature</div><div class="val" id="t">--</div></div>
-        <div class="card"><div class="label">Humidite</div><div class="val" id="h">--</div></div>
-        <div class="card"><div class="label">Batterie</div><div class="val" id="b">--</div></div>
-        <div class="card"><div class="label">Signal</div><div class="val" id="r">--</div></div>
+      <div class="tabbar">
+        <button class="tabbtn active" data-tab="live">Live</button>
+        <button class="tabbtn" data-tab="tech">Technique</button>
       </div>
 
-      <div class="charts">
-        <div class="card"><canvas id="cw"></canvas></div>
-        <div class="card"><canvas id="ct"></canvas></div>
-        <div class="card"><canvas id="ch"></canvas></div>
+      <div id="tabLive" class="tabpanel active">
+        <div class="alert" id="alertBox"></div>
+
+        <div class="kpis">
+          <div class="card"><div class="label">Poids</div><div class="val" id="w">--</div></div>
+          <div class="card"><div class="label">Temperature</div><div class="val" id="t">--</div></div>
+          <div class="card"><div class="label">Humidite</div><div class="val" id="h">--</div></div>
+          <div class="card"><div class="label">Batterie</div><div class="val" id="b">--</div></div>
+          <div class="card"><div class="label">Signal</div><div class="val" id="r">--</div></div>
+        </div>
+
+        <div class="charts">
+          <div class="card"><canvas id="cw"></canvas></div>
+          <div class="card"><canvas id="ct"></canvas></div>
+          <div class="card"><canvas id="ch"></canvas></div>
+        </div>
       </div>
 
-      <div class="card cmd">
-        <button id="cmdTare">Tare</button>
-        <input id="calMass" type="number" min="1" step="0.1" placeholder="Masse g" />
-        <button id="cmdCal">Calibrer</button>
-        <span id="cmdStatus" class="cmd-status">Commandes balance</span>
-      </div>
+      <div id="tabTech" class="tabpanel">
+        <div class="card cmd">
+          <button id="cmdTare">Tare</button>
+          <input id="calMass" type="number" min="1" step="0.1" placeholder="Masse g" />
+          <button id="cmdCal">Calibrer</button>
+          <span id="cmdStatus" class="cmd-status">Commandes balance</span>
+        </div>
 
-      <div class="raw" id="raw">Trame: --</div>
+        <div class="techgrid">
+          <div class="card"><div class="label">Timestamp</div><div id="techTs" class="mono">--</div></div>
+          <div class="card"><div class="label">Packet</div><div id="techPacket" class="mono">--</div></div>
+          <div class="card"><div class="label">RSSI / Batterie</div><div id="techRadioBatt" class="mono">--</div></div>
+          <div class="card"><div class="label">Alertes</div><div id="techAlerts" class="mono">--</div></div>
+          <div class="card"><div class="label">Dernier ACK</div><div id="techAck" class="mono">--</div></div>
+          <div class="card"><div class="label">Trame brute</div><div id="raw" class="mono">--</div></div>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -273,7 +326,7 @@
         $("h").textContent = last.hum_pct == null ? "--" : `${Math.round(last.hum_pct)} %`;
         $("b").textContent = last.batt_pct == null ? "--" : `${Math.round(last.batt_pct)} %`;
         $("r").textContent = last.rssi == null ? "--" : `${Math.round(last.rssi)} dBm`;
-        $("raw").textContent = `Trame: ${last.raw || "-"}`;
+        $("raw").textContent = `${last.raw || "-"}`;
 
         const alerts = [];
         if (Number.isFinite(lastMs) && (Date.now() - lastMs) > STALE_FLOW_MS) {
@@ -326,12 +379,33 @@
         const visible = getVisibleRows();
         const last = allRows.length ? allRows[allRows.length - 1] : null;
         updateKpis(last);
+        updateTechnical(last);
         drawFromRows(visible);
       }
 
       function renderAck() {
         if (!lastAck || !lastAck.payload) return;
         $("cmdStatus").textContent = `ACK ${new Date(lastAck.ts).toLocaleTimeString()} : ${lastAck.payload}`;
+        $("techAck").textContent = `${new Date(lastAck.ts).toLocaleTimeString()} | ${lastAck.payload}`;
+      }
+
+      function updateTechnical(last) {
+        if (!last) {
+          $("techTs").textContent = "--";
+          $("techPacket").textContent = "--";
+          $("techRadioBatt").textContent = "--";
+          $("techAlerts").textContent = "--";
+          if (!lastAck) $("techAck").textContent = "--";
+          return;
+        }
+        $("techTs").textContent = `${last.ts || "--"} (${new Date(last.ts).toLocaleString()})`;
+        $("techPacket").textContent = `${last.packet ?? "--"} | age ${Math.max(0, Math.floor((Date.now() - new Date(last.ts).getTime()) / 1000))}s`;
+        $("techRadioBatt").textContent = `RSSI ${last.rssi ?? "--"} dBm | BATT ${last.batt_pct ?? "--"} %`;
+        const alerts = [];
+        if (last.alert_signal_lost === 1 || last.alert_signal_lost === true) alerts.push("signal_lost");
+        if (last.alert_batt_low === 1 || last.alert_batt_low === true) alerts.push("battery_low");
+        if ((Date.now() - new Date(last.ts).getTime()) > STALE_FLOW_MS) alerts.push("stale_flow");
+        $("techAlerts").textContent = alerts.length ? alerts.join(", ") : "none";
       }
 
       function addRow(row) {
@@ -389,6 +463,19 @@
           document.querySelectorAll("button[data-range]").forEach((b) => b.classList.remove("active"));
           btn.classList.add("active");
           render();
+        });
+      });
+      document.querySelectorAll(".tabbtn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tab = btn.getAttribute("data-tab");
+          document.querySelectorAll(".tabbtn").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          document.querySelectorAll(".tabpanel").forEach((p) => p.classList.remove("active"));
+          if (tab === "tech") {
+            $("tabTech").classList.add("active");
+          } else {
+            $("tabLive").classList.add("active");
+          }
         });
       });
 
