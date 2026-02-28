@@ -260,8 +260,21 @@
 
       $("exportCsv").addEventListener("click", exportCsv);
 
+      async function bootstrapFromHttp() {
+        try {
+          const res = await fetch("/api/history", { cache: "no-store" });
+          if (!res.ok) return;
+          const payload = await res.json();
+          const hist = (payload && payload.history) || [];
+          allRows.length = 0;
+          hist.forEach((row) => addRow(row));
+          render();
+        } catch (_e) {}
+      }
+
       socket.on("bootstrap", (payload) => {
         const hist = (payload && payload.history) || [];
+        allRows.length = 0;
         hist.forEach((row) => addRow(row));
         render();
       });
@@ -270,6 +283,12 @@
         addRow(row);
         render();
       });
+
+      socket.on("connect_error", () => {
+        bootstrapFromHttp();
+      });
+
+      bootstrapFromHttp();
     </script>
   </body>
 </html>

@@ -39,11 +39,6 @@ if (fs.existsSync(TLS_PFX_PATH)) {
 
 const io = new Server(server, {
   cors: { origin: "*" },
-  allowRequest: (req, callback) => {
-    if (!authEnabled) return callback(null, true);
-    const ok = isAuthorized(req.headers.authorization);
-    callback(null, ok);
-  },
 });
 
 let pgPool = null;
@@ -70,6 +65,13 @@ app.get("/api/status", (_req, res) => {
     db_backend: usePostgres ? "postgres" : "sqlite",
     last: state.last,
     history_len: state.history.length,
+  });
+});
+
+app.get("/api/history", (_req, res) => {
+  res.json({
+    history: state.history,
+    last: state.last,
   });
 });
 
