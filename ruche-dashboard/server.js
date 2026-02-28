@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const http = require("http");
 const https = require("https");
 const fs = require("fs");
@@ -14,6 +14,7 @@ const TLS_PFX_PATH = process.env.TLS_PFX_PATH || path.join(__dirname, "cert", "r
 const TLS_PFX_PASSPHRASE = process.env.TLS_PFX_PASSPHRASE || "ruche-dashboard";
 const MQTT_URL = process.env.MQTT_URL || "mqtt://broker.hivemq.com:1883";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "ruches/telemetry";
+const MQTT_TOPIC_COMMAND = process.env.MQTT_TOPIC_COMMAND || "ruches/command";
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 2000);
 const DB_PATH = process.env.SQLITE_PATH || path.join(__dirname, "data", "history.sqlite3");
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -23,6 +24,7 @@ const authEnabled = DASH_USER.length > 0 && DASH_PASS.length > 0;
 const usePostgres = DATABASE_URL.length > 0;
 
 const app = express();
+app.use(express.json());
 
 let server;
 let httpsEnabled = false;
@@ -62,9 +64,38 @@ app.get("/api/status", (_req, res) => {
   res.json({
     mqtt_url: MQTT_URL,
     topic: MQTT_TOPIC,
+    topic_command: MQTT_TOPIC_COMMAND,
     db_backend: usePostgres ? "postgres" : "sqlite",
     last: state.last,
     history_len: state.history.length,
+  });
+});
+
+app.post("/api/command", (req, res) => {
+  const action = String(req.body?.action || "").toLowerCase();
+  let payload = "";
+
+  if (action === "tare") {
+    payload = "TARE";
+  } else if (action === "cal") {
+    const mass = Number(req.body?.mass_g);
+    if (!Number.isFinite(mass) || mass <= 0) {
+      return res.status(400).json({ ok: false, error: "mass_g invalide" });
+    }
+    payload = `CAL:${mass.toFixed(2)}`;
+  } else {
+    return res.status(400).json({ ok: false, error: "action invalide" });
+  }
+
+  if (!mqttClient.connected) {
+    return res.status(503).json({ ok: false, error: "mqtt deconnecte" });
+  }
+
+  mqttClient.publish(MQTT_TOPIC_COMMAND, payload, { qos: 0, retain: false }, (err) => {
+    if (err) {
+      return res.status(500).json({ ok: false, error: err.message });
+    }
+    return res.json({ ok: true, topic: MQTT_TOPIC_COMMAND, payload });
   });
 });
 
@@ -329,3 +360,4 @@ if (httpsEnabled) {
     console.log(`[HTTP] Redirect: http://127.0.0.1:${REDIRECT_HTTP_PORT} -> https://127.0.0.1:${HTTPS_PORT}`);
   });
 }
+

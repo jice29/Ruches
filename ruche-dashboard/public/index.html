@@ -93,6 +93,34 @@
       }
       canvas { width: 100%; height: 220px; }
       .raw { margin-top: 10px; color: var(--muted); font-size: 13px; word-break: break-all; }
+      .cmd {
+        margin-top: 12px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+      .cmd button {
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        border-radius: 10px;
+        padding: 8px 12px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .cmd input {
+        width: 120px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: #fffdfa;
+        color: var(--ink);
+      }
+      .cmd-status {
+        color: var(--muted);
+        font-size: 13px;
+      }
       .bee {
         width: 28px;
         height: 28px;
@@ -149,6 +177,13 @@
         <div class="card"><canvas id="cw"></canvas></div>
         <div class="card"><canvas id="ct"></canvas></div>
         <div class="card"><canvas id="ch"></canvas></div>
+      </div>
+
+      <div class="card cmd">
+        <button id="cmdTare">Tare</button>
+        <input id="calMass" type="number" min="1" step="0.1" placeholder="Masse g" />
+        <button id="cmdCal">Calibrer</button>
+        <span id="cmdStatus" class="cmd-status">Commandes balance</span>
       </div>
 
       <div class="raw" id="raw">Trame: --</div>
@@ -290,6 +325,19 @@
         URL.revokeObjectURL(url);
       }
 
+      async function sendCommand(payload) {
+        const r = await fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) {
+          throw new Error(data.error || `HTTP ${r.status}`);
+        }
+        return data;
+      }
+
       document.querySelectorAll("button[data-range]").forEach((btn) => {
         btn.addEventListener("click", () => {
           selectedRange = btn.getAttribute("data-range");
@@ -300,6 +348,31 @@
       });
 
       $("exportCsv").addEventListener("click", exportCsv);
+      $("cmdTare").addEventListener("click", async () => {
+        const box = $("cmdStatus");
+        box.textContent = "Envoi TARE...";
+        try {
+          const out = await sendCommand({ action: "tare" });
+          box.textContent = `OK: ${out.payload}`;
+        } catch (e) {
+          box.textContent = `Erreur: ${e.message}`;
+        }
+      });
+      $("cmdCal").addEventListener("click", async () => {
+        const box = $("cmdStatus");
+        const mass = Number($("calMass").value);
+        if (!Number.isFinite(mass) || mass <= 0) {
+          box.textContent = "Saisir une masse > 0";
+          return;
+        }
+        box.textContent = `Envoi CAL:${mass.toFixed(2)}...`;
+        try {
+          const out = await sendCommand({ action: "cal", mass_g: mass });
+          box.textContent = `OK: ${out.payload}`;
+        } catch (e) {
+          box.textContent = `Erreur: ${e.message}`;
+        }
+      });
 
       async function bootstrapFromHttp() {
         try {

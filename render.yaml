@@ -1,4 +1,4 @@
-services:
+﻿services:
   - type: web
     name: ruches-dashboard
     runtime: node
@@ -11,6 +11,8 @@ services:
         value: mqtt://broker.hivemq.com:1883
       - key: MQTT_TOPIC
         value: ruches/telemetry
+      - key: MQTT_TOPIC_COMMAND
+        value: ruches/command
       - key: DASH_USER
         sync: false
       - key: DASH_PASS
@@ -19,3 +21,5 @@ services:
         value: "2000"
       - key: DATABASE_URL
         sync: false
+
+
