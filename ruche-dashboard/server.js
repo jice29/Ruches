@@ -103,6 +103,8 @@ function sanitizeTelemetry(payload) {
   const batt = Number(payload.batt_pct);
   const rssi = Number(payload.rssi_dbm ?? payload.rssi);
   const packet = Number(payload.packet);
+  const alertSignalLost = Number(payload.alert_signal_lost);
+  const alertBattLow = Number(payload.alert_batt_low);
 
   if (!Number.isFinite(weight)) return null;
 
@@ -114,6 +116,8 @@ function sanitizeTelemetry(payload) {
     hum_pct: Number.isFinite(hum) ? hum : null,
     batt_pct: Number.isFinite(batt) ? batt : null,
     rssi: Number.isFinite(rssi) ? rssi : null,
+    alert_signal_lost: Number.isFinite(alertSignalLost) ? (alertSignalLost ? 1 : 0) : 0,
+    alert_batt_low: Number.isFinite(alertBattLow) ? (alertBattLow ? 1 : 0) : 0,
     raw: payload.raw ?? "",
   };
 }
@@ -127,6 +131,8 @@ function normalizeRows(rows) {
     hum_pct: r.hum_pct,
     batt_pct: r.batt_pct,
     rssi: r.rssi,
+    alert_signal_lost: r.alert_signal_lost || 0,
+    alert_batt_low: r.alert_batt_low || 0,
     raw: r.raw || "",
   }));
 }
@@ -147,9 +153,13 @@ async function initDb() {
         hum_pct DOUBLE PRECISION,
         batt_pct DOUBLE PRECISION,
         rssi INTEGER,
+        alert_signal_lost INTEGER DEFAULT 0,
+        alert_batt_low INTEGER DEFAULT 0,
         raw TEXT
       )
     `);
+    await pgPool.query(`ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alert_signal_lost INTEGER DEFAULT 0`);
+    await pgPool.query(`ALTER TABLE telemetry ADD COLUMN IF NOT EXISTS alert_batt_low INTEGER DEFAULT 0`);
     return;
   }
 
@@ -166,17 +176,25 @@ async function initDb() {
          hum_pct REAL,
          batt_pct REAL,
          rssi INTEGER,
+         alert_signal_lost INTEGER DEFAULT 0,
+         alert_batt_low INTEGER DEFAULT 0,
          raw TEXT
        )`,
       (err) => (err ? reject(err) : resolve())
     );
+  });
+  await new Promise((resolve) => {
+    sqliteDb.run(`ALTER TABLE telemetry ADD COLUMN alert_signal_lost INTEGER DEFAULT 0`, () => resolve());
+  });
+  await new Promise((resolve) => {
+    sqliteDb.run(`ALTER TABLE telemetry ADD COLUMN alert_batt_low INTEGER DEFAULT 0`, () => resolve());
   });
 }
 
 async function loadHistory() {
   if (usePostgres) {
     const rs = await pgPool.query(
-      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw
+      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, alert_signal_lost, alert_batt_low, raw
        FROM telemetry
        ORDER BY id DESC
        LIMIT $1`,
@@ -187,7 +205,7 @@ async function loadHistory() {
 
   const rows = await new Promise((resolve, reject) => {
     sqliteDb.all(
-      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw
+      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, alert_signal_lost, alert_batt_low, raw
        FROM telemetry
        ORDER BY id DESC
        LIMIT ?`,
@@ -201,9 +219,9 @@ async function loadHistory() {
 async function saveTelemetry(row) {
   if (usePostgres) {
     await pgPool.query(
-      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.raw]
+      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, alert_signal_lost, alert_batt_low, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.alert_signal_lost, row.alert_batt_low, row.raw]
     );
     await pgPool.query(
       `DELETE FROM telemetry
@@ -215,9 +233,9 @@ async function saveTelemetry(row) {
 
   await new Promise((resolve, reject) => {
     sqliteDb.run(
-      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.raw],
+      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, alert_signal_lost, alert_batt_low, raw)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.alert_signal_lost, row.alert_batt_low, row.raw],
       (err) => (err ? reject(err) : resolve())
     );
   });

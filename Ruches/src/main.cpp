@@ -67,7 +67,7 @@ bool oled_working = false;
 bool tareInProgress = false;
 bool waitingKnownMass = false;
 unsigned long previousMillis = 0;
-const long interval = 60000;
+const long interval = 15000;
 char txpacket[64];
 String serialLine;
 float currentCalFactor = 696.0f;
@@ -419,6 +419,30 @@ void saveCalFactor(float factor) {
     EEPROM.commit();
 }
 
+bool performCalibrationWithMass(float knownMass) {
+    if (knownMass <= 0.0f) {
+        Serial.println("Masse invalide. Exemple: c500");
+        return false;
+    }
+
+    LoadCell.refreshDataSet();
+    float newCal = LoadCell.getNewCalibration(knownMass);
+    if (isnan(newCal) || isinf(newCal) || newCal == 0.0f) {
+        Serial.println("Calibration echouee");
+        displayMessage("Calib KO", "Valeur invalide");
+        return false;
+    }
+
+    currentCalFactor = newCal;
+    LoadCell.setCalFactor(currentCalFactor);
+    saveCalFactor(currentCalFactor);
+
+    Serial.print("Nouveau calFactor: ");
+    Serial.println(currentCalFactor, 2);
+    displayMessage("Calib OK", String(currentCalFactor, 2));
+    return true;
+}
+
 void processSerialLine(String line) {
     line.trim();
     if (line.length() == 0) return;
@@ -430,23 +454,11 @@ void processSerialLine(String line) {
             return;
         }
 
-        LoadCell.refreshDataSet();
-        float newCal = LoadCell.getNewCalibration(knownMass);
-        if (isnan(newCal) || isinf(newCal) || newCal == 0.0f) {
-            Serial.println("Calibration echouee");
-            displayMessage("Calib KO", "Valeur invalide");
+        if (!performCalibrationWithMass(knownMass)) {
             waitingKnownMass = false;
             return;
         }
-
-        currentCalFactor = newCal;
-        LoadCell.setCalFactor(currentCalFactor);
-        saveCalFactor(currentCalFactor);
         waitingKnownMass = false;
-
-        Serial.print("Nouveau calFactor: ");
-        Serial.println(currentCalFactor, 2);
-        displayMessage("Calib OK", String(currentCalFactor, 2));
         return;
     }
 
@@ -459,15 +471,27 @@ void processSerialLine(String line) {
             displayMessage("Tare...");
             break;
         case 'c':
-            waitingKnownMass = true;
-            Serial.println("Poser masse connue puis saisir la masse en g (ex: 500.0)");
-            displayMessage("Calibration", "Entrez masse g");
+            {
+                String massToken = line.substring(1);
+                massToken.trim();
+                if (massToken.length() > 0) {
+                    float knownMass = massToken.toFloat();
+                    if (!performCalibrationWithMass(knownMass)) {
+                        Serial.println("Usage: c500  (ou c puis 500)");
+                    }
+                } else {
+                    waitingKnownMass = true;
+                    Serial.println("Poser masse connue puis saisir la masse en g (ex: 500.0)");
+                    Serial.println("Astuce rapide: c500");
+                    displayMessage("Calibration", "Entrez masse g");
+                }
+            }
             break;
         case 'x':
             envoyerPaquet("TEST");
             break;
         case 'h':
-            Serial.println("Commandes: t=tare, c=calibrage, x=test envoi, h=aide");
+            Serial.println("Commandes: t=tare, c=calibrage, c500=calib rapide, x=test envoi, h=aide");
             break;
         default:
             Serial.println("Commande inconnue. h pour aide.");

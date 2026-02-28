@@ -15,6 +15,7 @@
         --accent: #b66c2f;
         --accent2: #2f6b5b;
         --line: #e1dac8;
+        --warn: #9b2f1f;
       }
       * { box-sizing: border-box; }
       body {
@@ -29,6 +30,35 @@
       }
       h1 { margin: 0; font-size: 28px; letter-spacing: .3px; }
       .status { color: var(--muted); font-size: 14px; }
+      .controls {
+        margin-top: 10px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .controls button {
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink);
+        border-radius: 10px;
+        padding: 7px 10px;
+        cursor: pointer;
+      }
+      .controls button.active {
+        border-color: var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .alert {
+        margin-top: 10px;
+        padding: 8px 10px;
+        border: 1px solid #efc7bf;
+        background: #fff2ef;
+        color: var(--warn);
+        border-radius: 10px;
+        font-size: 13px;
+        display: none;
+      }
       .kpis {
         margin-top: 12px; display: grid; gap: 10px;
         grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -56,10 +86,21 @@
         <div class="status" id="status">En attente...</div>
       </div>
 
+      <div class="controls">
+        <button data-range="15m">15m</button>
+        <button data-range="1h" class="active">1h</button>
+        <button data-range="6h">6h</button>
+        <button data-range="24h">24h</button>
+        <button data-range="all">Tout</button>
+        <button id="exportCsv">Export CSV</button>
+      </div>
+
+      <div class="alert" id="alertBox"></div>
+
       <div class="kpis">
         <div class="card"><div class="label">Poids</div><div class="val" id="w">--</div></div>
-        <div class="card"><div class="label">Température</div><div class="val" id="t">--</div></div>
-        <div class="card"><div class="label">Humidité</div><div class="val" id="h">--</div></div>
+        <div class="card"><div class="label">Temperature</div><div class="val" id="t">--</div></div>
+        <div class="card"><div class="label">Humidite</div><div class="val" id="h">--</div></div>
         <div class="card"><div class="label">Batterie</div><div class="val" id="b">--</div></div>
         <div class="card"><div class="label">Signal</div><div class="val" id="r">--</div></div>
       </div>
@@ -74,9 +115,11 @@
     </div>
 
     <script>
-      const MAX_POINTS = 700;
       const socket = io();
       const $ = (id) => document.getElementById(id);
+      const MAX_POINTS = 5000;
+      let selectedRange = "1h";
+      const allRows = [];
 
       function mkChart(id, label, color, yMin = null, yMax = null) {
         return new Chart($(id), {
@@ -88,59 +131,145 @@
             animation: false,
             scales: {
               x: { ticks: { maxTicksLimit: 8 } },
-              y: {
-                min: yMin,
-                max: yMax
-              }
+              y: { min: yMin, max: yMax }
             }
           }
         });
       }
 
-      const cw = mkChart("cw", "Poids (g)", "#b66c2f", 0, 100000); // 0..100 kg
+      const cw = mkChart("cw", "Poids (g)", "#b66c2f", 0, 100000);
       const ct = mkChart("ct", "Temp (C)", "#2f6b5b", -10, 60);
       const ch = mkChart("ch", "Hum (%)", "#325e88", 0, 100);
 
-      function pushPoint(chart, x, y) {
-        chart.data.labels.push(x);
-        chart.data.datasets[0].data.push(y);
-        if (chart.data.labels.length > MAX_POINTS) {
-          chart.data.labels.shift();
-          chart.data.datasets[0].data.shift();
+      function rangeToMs(key) {
+        if (key === "15m") return 15 * 60 * 1000;
+        if (key === "1h") return 60 * 60 * 1000;
+        if (key === "6h") return 6 * 60 * 60 * 1000;
+        if (key === "24h") return 24 * 60 * 60 * 1000;
+        return null;
+      }
+
+      function getVisibleRows() {
+        const ms = rangeToMs(selectedRange);
+        if (ms == null) return [...allRows];
+        const minTs = Date.now() - ms;
+        return allRows.filter((r) => new Date(r.ts).getTime() >= minTs);
+      }
+
+      function updateKpis(last) {
+        if (!last) return;
+        $("status").textContent = `Dernier paquet: ${last.packet ?? "-"} | ${new Date(last.ts).toLocaleTimeString()}`;
+        $("w").textContent = `${Math.round(last.weight_g)} g`;
+        $("t").textContent = last.temp_c == null ? "--" : `${Math.round(last.temp_c)} C`;
+        $("h").textContent = last.hum_pct == null ? "--" : `${Math.round(last.hum_pct)} %`;
+        $("b").textContent = last.batt_pct == null ? "--" : `${Math.round(last.batt_pct)} %`;
+        $("r").textContent = last.rssi == null ? "--" : `${Math.round(last.rssi)} dBm`;
+        $("raw").textContent = `Trame: ${last.raw || "-"}`;
+
+        const alerts = [];
+        if (last.alert_signal_lost === 1 || last.alert_signal_lost === true) alerts.push("Signal LoRa perdu");
+        if (last.alert_batt_low === 1 || last.alert_batt_low === true) alerts.push("Batterie faible");
+        const box = $("alertBox");
+        if (alerts.length > 0) {
+          box.style.display = "block";
+          box.textContent = `Alerte: ${alerts.join(" | ")}`;
+        } else {
+          box.style.display = "none";
+          box.textContent = "";
         }
       }
 
-      function applyRow(row) {
-        $("status").textContent = `Dernier paquet: ${row.packet ?? "-"} | ${new Date(row.ts).toLocaleTimeString()}`;
-        $("w").textContent = `${Math.round(row.weight_g)} g`;
-        $("t").textContent = row.temp_c == null ? "--" : `${Math.round(row.temp_c)} C`;
-        $("h").textContent = row.hum_pct == null ? "--" : `${Math.round(row.hum_pct)} %`;
-        $("b").textContent = row.batt_pct == null ? "--" : `${Math.round(row.batt_pct)} %`;
-        $("r").textContent = row.rssi == null ? "--" : `${Math.round(row.rssi)} dBm`;
-        $("raw").textContent = `Trame: ${row.raw || "-"}`;
+      function drawFromRows(rows) {
+        cw.data.labels = [];
+        cw.data.datasets[0].data = [];
+        ct.data.labels = [];
+        ct.data.datasets[0].data = [];
+        ch.data.labels = [];
+        ch.data.datasets[0].data = [];
 
-        const x = new Date(row.ts).toLocaleTimeString();
-        pushPoint(cw, x, row.weight_g);
-        if (row.temp_c != null) pushPoint(ct, x, row.temp_c);
-        if (row.hum_pct != null) pushPoint(ch, x, row.hum_pct);
-      }
+        rows.forEach((row) => {
+          const x = new Date(row.ts).toLocaleTimeString();
+          cw.data.labels.push(x);
+          cw.data.datasets[0].data.push(row.weight_g);
+          if (row.temp_c != null) {
+            ct.data.labels.push(x);
+            ct.data.datasets[0].data.push(row.temp_c);
+          }
+          if (row.hum_pct != null) {
+            ch.data.labels.push(x);
+            ch.data.datasets[0].data.push(row.hum_pct);
+          }
+        });
 
-      function redraw() {
         cw.update("none");
         ct.update("none");
         ch.update("none");
       }
 
+      function render() {
+        const visible = getVisibleRows();
+        const last = allRows.length ? allRows[allRows.length - 1] : null;
+        updateKpis(last);
+        drawFromRows(visible);
+      }
+
+      function addRow(row) {
+        allRows.push(row);
+        if (allRows.length > MAX_POINTS) allRows.shift();
+      }
+
+      function exportCsv() {
+        const rows = getVisibleRows();
+        const header = ["ts","packet","weight_g","temp_c","hum_pct","batt_pct","rssi","alert_signal_lost","alert_batt_low","raw"];
+        const lines = [header.join(",")];
+        rows.forEach((r) => {
+          const vals = [
+            r.ts,
+            r.packet ?? "",
+            r.weight_g ?? "",
+            r.temp_c ?? "",
+            r.hum_pct ?? "",
+            r.batt_pct ?? "",
+            r.rssi ?? "",
+            r.alert_signal_lost ?? "",
+            r.alert_batt_low ?? "",
+            (r.raw || "").replace(/"/g, '""')
+          ];
+          lines.push(vals.map((v, i) => i === 9 ? `"${v}"` : `${v}`).join(","));
+        });
+        const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        a.href = url;
+        a.download = `ruches_${selectedRange}_${stamp}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+      document.querySelectorAll("button[data-range]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          selectedRange = btn.getAttribute("data-range");
+          document.querySelectorAll("button[data-range]").forEach((b) => b.classList.remove("active"));
+          btn.classList.add("active");
+          render();
+        });
+      });
+
+      $("exportCsv").addEventListener("click", exportCsv);
+
       socket.on("bootstrap", (payload) => {
         const hist = (payload && payload.history) || [];
-        hist.forEach((row) => applyRow(row));
-        redraw();
+        hist.forEach((row) => addRow(row));
+        render();
       });
 
       socket.on("telemetry", (row) => {
-        applyRow(row);
-        redraw();
+        addRow(row);
+        render();
       });
     </script>
   </body>
-  </html>
+</html>

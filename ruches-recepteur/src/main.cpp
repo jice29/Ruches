@@ -9,7 +9,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
 #include <PubSubClient.h>
+#include <esp_task_wdt.h>
 
 #ifndef WIFI_SSID_VALUE
 #define WIFI_SSID_VALUE ""
@@ -17,6 +20,14 @@
 
 #ifndef WIFI_PASSWORD_VALUE
 #define WIFI_PASSWORD_VALUE ""
+#endif
+
+#ifndef DEVICE_LOGIN_NAME_VALUE
+#define DEVICE_LOGIN_NAME_VALUE ""
+#endif
+
+#ifndef DEVICE_KEY_VALUE
+#define DEVICE_KEY_VALUE ""
 #endif
 
 // ===== Configuration OLED =====
@@ -40,16 +51,21 @@ Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 SX1262 radio = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY);
 
-// ===== Configuration WiFi / MQTT =====
+// ===== Configuration WiFi / Arduino Cloud =====
 const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+const char* DEVICE_LOGIN_NAME = DEVICE_LOGIN_NAME_VALUE;
+const char* DEVICE_KEY = DEVICE_KEY_VALUE;
 const char* MQTT_HOST = "broker.hivemq.com";
-const char* MQTT_HOST_FALLBACK = "10.149.56.92";
 const uint16_t MQTT_PORT = 1883;
-const uint16_t MQTT_PORT_FALLBACK = 1884;
-const char* MQTT_USER = "";
-const char* MQTT_PASSWORD = "";
 const char* MQTT_TOPIC_TELEMETRY = "ruches/telemetry";
+const char* MQTT_TOPIC_ALERT = "ruches/alert";
+
+float weight_g = 0.0f;
+float temp_c = 0.0f;
+float hum_pct = 0.0f;
+float batt_pct = 0.0f;
+int rssi_dbm = 0;
 
 // ===== Variables =====
 uint32_t packetCount = 0;
@@ -63,20 +79,90 @@ volatile bool receivedFlag = false;
 bool radio_receiveMode = false;
 unsigned long lastReceiveCheck = 0;
 int receiveErrorCount = 0;
-unsigned long lastWifiTryMs = 0;
-unsigned long lastMqttTryMs = 0;
-unsigned long lastHeartbeatMs = 0;
 unsigned long lastLoraPacketMs = 0;
-const unsigned long HEARTBEAT_INTERVAL_MS = 10000;
-bool useFallbackBroker = false;
 bool wifiInfoPrinted = false;
 bool wifiConfigWarningPrinted = false;
+bool cloudEnabled = false;
+const long CLOUD_UPDATE_INTERVAL_S = 15;
+unsigned long lastMqttTryMs = 0;
+bool mqttInfoPrinted = false;
+unsigned long lastWifiTryMs = 0;
+unsigned long lastHealthyNetworkMs = 0;
+const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+const unsigned long LORA_SIGNAL_LOSS_MS = 45000;
+const int BATT_LOW_THRESHOLD_PCT = 20;
+const unsigned long NETWORK_STALL_RESTART_MS = 300000;
+bool alertSignalLost = false;
+bool alertBatteryLow = false;
+bool prevAlertSignalLost = false;
+bool prevAlertBatteryLow = false;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
+WiFiConnectionHandler ArduinoIoTPreferredConnection(WIFI_SSID, WIFI_PASSWORD);
+
+void initProperties() {
+    ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
+    ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
+    ArduinoCloud.addProperty(weight_g, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
+    ArduinoCloud.addProperty(temp_c, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
+    ArduinoCloud.addProperty(hum_pct, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
+    ArduinoCloud.addProperty(batt_pct, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
+    ArduinoCloud.addProperty(rssi_dbm, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
+}
+
 void setFlag() {
     receivedFlag = true;
+}
+
+void publishAlertEvent(const char* type, bool active) {
+    if (!mqttClient.connected()) return;
+    char json[160];
+    int n = snprintf(
+        json,
+        sizeof(json),
+        "{\"type\":\"%s\",\"active\":%d,\"packet\":%lu,\"ts_ms\":%lu}",
+        type,
+        active ? 1 : 0,
+        (unsigned long)packetCount,
+        (unsigned long)millis()
+    );
+    if (n > 0 && n < (int)sizeof(json)) {
+        mqttClient.publish(MQTT_TOPIC_ALERT, json, true);
+    }
+}
+
+void updateAlertStates(unsigned long now) {
+    alertSignalLost = (lastLoraPacketMs > 0) && ((now - lastLoraPacketMs) > LORA_SIGNAL_LOSS_MS);
+    alertBatteryLow = (lastBattPct >= 0.0f) && (lastBattPct <= (float)BATT_LOW_THRESHOLD_PCT);
+
+    if (alertSignalLost != prevAlertSignalLost) {
+        Serial.print("ALERTE Signal ");
+        Serial.println(alertSignalLost ? "PERDU" : "RETABLI");
+        publishAlertEvent("signal_lost", alertSignalLost);
+        prevAlertSignalLost = alertSignalLost;
+    }
+    if (alertBatteryLow != prevAlertBatteryLow) {
+        Serial.print("ALERTE Batterie ");
+        Serial.println(alertBatteryLow ? "BASSE" : "OK");
+        publishAlertEvent("battery_low", alertBatteryLow);
+        prevAlertBatteryLow = alertBatteryLow;
+    }
+}
+
+void ensureWiFiConnection() {
+    if (strlen(WIFI_SSID) == 0) return;
+    if (WiFi.status() == WL_CONNECTED) return;
+
+    unsigned long now = millis();
+    if (now - lastWifiTryMs < WIFI_RETRY_INTERVAL_MS) return;
+    lastWifiTryMs = now;
+
+    Serial.print("WiFi reconnexion: ");
+    Serial.println(WIFI_SSID);
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 uint8_t rssiToBars(int16_t rssi) {
@@ -224,6 +310,14 @@ void updateDisplay() {
     oled.setCursor(82, 54);
     oled.print("SGN");
     drawSignalBars(lastRSSI, 100, 52);
+
+    if (alertSignalLost || alertBatteryLow) {
+        oled.setTextSize(1);
+        oled.setCursor(80, 0);
+        oled.print("ALR:");
+        if (alertSignalLost) oled.print("SIG ");
+        if (alertBatteryLow) oled.print("BAT");
+    }
     
     oled.display();
 }
@@ -237,113 +331,59 @@ float parseFieldValue(const String& payload, const String& key, float fallback) 
     return token.toFloat();
 }
 
-void ensureWiFi() {
-    if (strlen(WIFI_SSID) == 0) {
-        if (!wifiConfigWarningPrinted) {
-            Serial.println("WiFi desactive: SSID vide (configurer WIFI_SSID).");
-            wifiConfigWarningPrinted = true;
-        }
-        return;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!wifiInfoPrinted) {
-            Serial.print("WiFi OK IP=");
-            Serial.print(WiFi.localIP());
-            Serial.print(" RSSI=");
-            Serial.println(WiFi.RSSI());
-            wifiInfoPrinted = true;
-        }
-        return;
-    }
-    wifiInfoPrinted = false;
-    unsigned long now = millis();
-    if (now - lastWifiTryMs < 10000) return;
-    lastWifiTryMs = now;
-
-    Serial.print("WiFi connexion: ");
-    Serial.println(WIFI_SSID);
-    WiFi.disconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
 void ensureMqtt() {
-    if (mqttClient.connected()) return;
+    if (mqttClient.connected()) {
+        if (!mqttInfoPrinted) {
+            Serial.println("MQTT connecte");
+            mqttInfoPrinted = true;
+        }
+        return;
+    }
+    mqttInfoPrinted = false;
     if (WiFi.status() != WL_CONNECTED) return;
 
     unsigned long now = millis();
     if (now - lastMqttTryMs < 5000) return;
     lastMqttTryMs = now;
 
-    const char* host = useFallbackBroker ? MQTT_HOST_FALLBACK : MQTT_HOST;
-    const uint16_t port = useFallbackBroker ? MQTT_PORT_FALLBACK : MQTT_PORT;
-    mqttClient.setServer(host, port);
-
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
     String clientId = "ruches-rx-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    bool ok;
-    if (strlen(MQTT_USER) > 0) {
-        ok = mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD);
-    } else {
-        ok = mqttClient.connect(clientId.c_str());
-    }
+    bool ok = mqttClient.connect(clientId.c_str());
     if (ok) {
         Serial.print("MQTT connecte sur ");
-        Serial.print(host);
+        Serial.print(MQTT_HOST);
         Serial.print(":");
-        Serial.println(port);
-        useFallbackBroker = false;
+        Serial.println(MQTT_PORT);
     } else {
         Serial.print("MQTT echec state=");
-        Serial.print(mqttClient.state());
-        Serial.print(" host=");
-        Serial.print(host);
-        Serial.print(":");
-        Serial.println(port);
-        useFallbackBroker = !useFallbackBroker;
+        Serial.println(mqttClient.state());
     }
 }
 
-void publishTelemetry(const String& rawPayload) {
+void publishTelemetryMqtt(const String& rawPayload) {
     if (!mqttClient.connected()) return;
 
-    char json[256];
+    char json[320];
+    unsigned long lastLoraAgeSec = (lastLoraPacketMs == 0) ? 0 : (millis() - lastLoraPacketMs) / 1000UL;
     int n = snprintf(
         json,
         sizeof(json),
-        "{\"packet\":%lu,\"weight_g\":%.2f,\"temp_c\":%.1f,\"hum_pct\":%.1f,\"batt_pct\":%.0f,\"rssi\":%d,\"raw\":\"%s\"}",
+        "{\"packet\":%lu,\"weight_g\":%.2f,\"temp_c\":%.1f,\"hum_pct\":%.1f,\"batt_pct\":%.0f,\"rssi\":%d,\"rssi_dbm\":%d,\"alert_signal_lost\":%d,\"alert_batt_low\":%d,\"last_lora_s\":%lu,\"raw\":\"%s\"}",
         (unsigned long)packetCount,
         lastWeight,
         isnan(lastTempC) ? -999.0f : lastTempC,
         isnan(lastHumPct) ? -999.0f : lastHumPct,
         (lastBattPct < 0.0f) ? -1.0f : lastBattPct,
         (int)lastRSSI,
+        (int)lastRSSI,
+        alertSignalLost ? 1 : 0,
+        alertBatteryLow ? 1 : 0,
+        lastLoraAgeSec,
         rawPayload.c_str()
     );
     if (n <= 0 || n >= (int)sizeof(json)) return;
 
     mqttClient.publish(MQTT_TOPIC_TELEMETRY, json, true);
-}
-
-void publishHeartbeat(unsigned long nowMs) {
-    if (!mqttClient.connected()) return;
-    if (nowMs - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
-    lastHeartbeatMs = nowMs;
-
-    char json[256];
-    int n = snprintf(
-        json,
-        sizeof(json),
-        "{\"heartbeat\":true,\"uptime_s\":%lu,\"wifi\":%d,\"mqtt\":%d,\"packets\":%lu,\"last_lora_s\":%lu}",
-        (unsigned long)(nowMs / 1000UL),
-        (WiFi.status() == WL_CONNECTED) ? 1 : 0,
-        mqttClient.connected() ? 1 : 0,
-        (unsigned long)packetCount,
-        (unsigned long)((lastLoraPacketMs == 0) ? 0 : ((nowMs - lastLoraPacketMs) / 1000UL))
-    );
-    if (n <= 0 || n >= (int)sizeof(json)) return;
-
-    mqttClient.publish(MQTT_TOPIC_TELEMETRY, json, false);
-    Serial.println("MQTT heartbeat");
 }
 
 // ===== Initialisation LoRa =====
@@ -401,16 +441,24 @@ void setup() {
     Serial.println("RECEPTEUR LORA - RADIOLIB V5");
     Serial.println("================================\n");
 
+    esp_task_wdt_init(30, true);
+    esp_task_wdt_add(NULL);
+
     WiFi.mode(WIFI_STA);
-    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-    Serial.print("MQTT principal: ");
-    Serial.print(MQTT_HOST);
-    Serial.print(":");
-    Serial.println(MQTT_PORT);
-    Serial.print("MQTT fallback: ");
-    Serial.print(MQTT_HOST_FALLBACK);
-    Serial.print(":");
-    Serial.println(MQTT_PORT_FALLBACK);
+    if (strlen(WIFI_SSID) == 0) {
+        Serial.println("Arduino Cloud desactive: SSID vide.");
+        wifiConfigWarningPrinted = true;
+    } else if (strlen(DEVICE_LOGIN_NAME) == 0 || strlen(DEVICE_KEY) == 0) {
+        Serial.println("Arduino Cloud desactive: DEVICE_LOGIN_NAME/DEVICE_KEY vides.");
+    } else {
+        initProperties();
+        ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+        setDebugMessageLevel(2);
+        ArduinoCloud.printDebugInfo();
+        cloudEnabled = true;
+        Serial.println("Arduino Cloud actif.");
+        mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    }
     
     oled_working = initOLED();
     delay(500);
@@ -432,10 +480,34 @@ void setup() {
 // ===== Loop =====
 void loop() {
     unsigned long now = millis();
-    ensureWiFi();
-    ensureMqtt();
-    mqttClient.loop();
-    publishHeartbeat(now);
+    esp_task_wdt_reset();
+
+    ensureWiFiConnection();
+    updateAlertStates(now);
+
+    if (cloudEnabled) {
+        ArduinoCloud.update();
+        ensureMqtt();
+        mqttClient.loop();
+        if (WiFi.status() == WL_CONNECTED && !wifiInfoPrinted) {
+            Serial.print("WiFi OK IP=");
+            Serial.print(WiFi.localIP());
+            Serial.print(" RSSI=");
+            Serial.println(WiFi.RSSI());
+            wifiInfoPrinted = true;
+        } else if (WiFi.status() != WL_CONNECTED) {
+            wifiInfoPrinted = false;
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+        lastHealthyNetworkMs = now;
+    }
+    if (lastHealthyNetworkMs > 0 && (now - lastHealthyNetworkMs) > NETWORK_STALL_RESTART_MS) {
+        Serial.println("Redemarrage securite reseau (stall > 5 min)...");
+        delay(100);
+        ESP.restart();
+    }
     
     // POLLING toutes les 100ms
     if (now - lastReceiveCheck > 100) {
@@ -468,7 +540,12 @@ void loop() {
                 lastTempC = parseFieldValue(received, "T_C:", lastTempC);
                 lastHumPct = parseFieldValue(received, "H_P:", lastHumPct);
                 lastBattPct = parseFieldValue(received, "B_P:", lastBattPct);
-                publishTelemetry(received);
+                weight_g = lastWeight;
+                temp_c = isnan(lastTempC) ? temp_c : lastTempC;
+                hum_pct = isnan(lastHumPct) ? hum_pct : lastHumPct;
+                batt_pct = (lastBattPct < 0.0f) ? batt_pct : lastBattPct;
+                rssi_dbm = (int)lastRSSI;
+                publishTelemetryMqtt(received);
                 
                 Serial.print("Paquet #");
                 Serial.print(packetCount);
@@ -509,7 +586,12 @@ void loop() {
                     lastTempC = parseFieldValue(received, "T_C:", lastTempC);
                     lastHumPct = parseFieldValue(received, "H_P:", lastHumPct);
                     lastBattPct = parseFieldValue(received, "B_P:", lastBattPct);
-                    publishTelemetry(received);
+                    weight_g = lastWeight;
+                    temp_c = isnan(lastTempC) ? temp_c : lastTempC;
+                    hum_pct = isnan(lastHumPct) ? hum_pct : lastHumPct;
+                    batt_pct = (lastBattPct < 0.0f) ? batt_pct : lastBattPct;
+                    rssi_dbm = (int)lastRSSI;
+                    publishTelemetryMqtt(received);
                     
                     Serial.print("Paquet #");
                     Serial.print(packetCount);
@@ -539,8 +621,24 @@ void loop() {
     static unsigned long lastDisplay = 0;
     if (now - lastDisplay > 200) {
         lastDisplay = now;
+        updateAlertStates(now);
         updateDisplay();
     }
     
     delay(5);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
