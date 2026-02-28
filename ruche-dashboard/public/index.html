@@ -8,14 +8,14 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <style>
       :root {
-        --bg: #fff7dd;
-        --card: #ffffff;
-        --ink: #2a1f10;
-        --muted: #6b5d4c;
-        --accent: #f2a900;
-        --accent2: #7a3cff;
-        --line: #efd59a;
-        --warn: #ba2d0b;
+        --bg: #0f1420;
+        --card: #192234;
+        --ink: #f0f4ff;
+        --muted: #a9b6d1;
+        --accent: #ffb703;
+        --accent2: #8f6dff;
+        --line: #2b3752;
+        --warn: #ff7b7b;
       }
       * { box-sizing: border-box; }
       body {
@@ -23,9 +23,9 @@
         font-family: "Segoe UI", Tahoma, sans-serif;
         color: var(--ink);
         background:
-          radial-gradient(circle at 10% 10%, #fff3b0 0%, transparent 36%),
-          radial-gradient(circle at 90% 5%, #e1c8ff 0%, transparent 30%),
-          linear-gradient(135deg, #fff8e8 0%, var(--bg) 100%);
+          radial-gradient(circle at 12% 8%, #1e2b45 0%, transparent 36%),
+          radial-gradient(circle at 90% 6%, #332559 0%, transparent 30%),
+          linear-gradient(135deg, #121a2c 0%, var(--bg) 100%);
       }
       .wrap { max-width: 1150px; margin: 20px auto; padding: 0 14px; }
       .head {
@@ -59,8 +59,8 @@
       }
       .tabbtn.active {
         border-color: var(--accent2);
-        background: #f1e8ff;
-        color: #3f246f;
+        background: #2d2550;
+        color: #e9ddff;
         font-weight: 600;
       }
       .tabpanel {
@@ -79,15 +79,15 @@
       }
       .controls button.active {
         border-color: var(--accent);
-        color: #6a3f00;
-        background: #ffe8ad;
+        color: #1d1400;
+        background: #ffcf5a;
         font-weight: 600;
       }
       .alert {
         margin-top: 10px;
         padding: 8px 10px;
-        border: 1px solid #efc7bf;
-        background: #fff2ef;
+        border: 1px solid #5a2a2a;
+        background: #3a1f25;
         color: var(--warn);
         border-radius: 10px;
         font-size: 13px;
@@ -102,7 +102,7 @@
         border: 1px solid var(--line);
         border-radius: 12px;
         padding: 12px;
-        box-shadow: 0 6px 18px rgba(157, 127, 46, 0.08);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
       }
       .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
       .val {
@@ -110,7 +110,7 @@
         font-size: 30px;
         font-weight: 700;
         line-height: 1;
-        color: #7a4d00;
+        color: #ffd166;
       }
       .charts {
         margin-top: 12px; display: grid; gap: 10px;
@@ -139,7 +139,7 @@
         border: 1px solid var(--line);
         border-radius: 10px;
         padding: 8px 10px;
-        background: #fffdfa;
+        background: #111a2b;
         color: var(--ink);
       }
       .cmd-status {
@@ -155,7 +155,7 @@
       .mono {
         font-family: Consolas, "Courier New", monospace;
         font-size: 13px;
-        color: #3a2a19;
+        color: #d5def1;
         word-break: break-word;
       }
       .bee {
