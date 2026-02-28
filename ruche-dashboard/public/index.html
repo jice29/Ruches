@@ -218,6 +218,30 @@
       const ct = mkChart("ct", "Temp (C)", "#2f6b5b", -10, 60);
       const ch = mkChart("ch", "Hum (%)", "#325e88", 0, 100);
 
+      function autoScaleY(chart, values, paddingRatio = 0.1, minSpan = 1, minClamp = null, maxClamp = null) {
+        const finiteVals = values.filter((v) => Number.isFinite(v));
+        if (!finiteVals.length) {
+          chart.options.scales.y.min = undefined;
+          chart.options.scales.y.max = undefined;
+          return;
+        }
+
+        let vMin = Math.min(...finiteVals);
+        let vMax = Math.max(...finiteVals);
+        let span = vMax - vMin;
+        if (span < minSpan) span = minSpan;
+
+        let yMin = vMin - span * paddingRatio;
+        let yMax = vMax + span * paddingRatio;
+
+        if (minClamp != null) yMin = Math.max(minClamp, yMin);
+        if (maxClamp != null) yMax = Math.min(maxClamp, yMax);
+        if (yMax <= yMin) yMax = yMin + minSpan;
+
+        chart.options.scales.y.min = yMin;
+        chart.options.scales.y.max = yMax;
+      }
+
       function rangeToMs(key) {
         if (key === "1d") return 24 * 60 * 60 * 1000;
         if (key === "1w") return 7 * 24 * 60 * 60 * 1000;
@@ -288,6 +312,10 @@
             ch.data.datasets[0].data.push(row.hum_pct);
           }
         });
+
+        autoScaleY(cw, cw.data.datasets[0].data, 0.12, 0.25, 0, null);
+        autoScaleY(ct, ct.data.datasets[0].data, 0.15, 1.5, null, null);
+        autoScaleY(ch, ch.data.datasets[0].data, 0.15, 2, 0, 100);
 
         cw.update("none");
         ct.update("none");
