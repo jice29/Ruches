@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
 const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 const { Server } = require("socket.io");
 
 const HTTPS_PORT = Number(process.env.PORT || process.env.HTTPS_PORT || process.env.HTTP_PORT || 8090);
@@ -15,9 +16,11 @@ const MQTT_URL = process.env.MQTT_URL || "mqtt://broker.hivemq.com:1883";
 const MQTT_TOPIC = process.env.MQTT_TOPIC || "ruches/telemetry";
 const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 2000);
 const DB_PATH = process.env.SQLITE_PATH || path.join(__dirname, "data", "history.sqlite3");
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const DASH_USER = process.env.DASH_USER || "";
 const DASH_PASS = process.env.DASH_PASS || "";
 const authEnabled = DASH_USER.length > 0 && DASH_PASS.length > 0;
+const usePostgres = DATABASE_URL.length > 0;
 
 const app = express();
 
@@ -43,23 +46,8 @@ const io = new Server(server, {
   },
 });
 
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new sqlite3.Database(DB_PATH);
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS telemetry (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts TEXT NOT NULL,
-      packet INTEGER,
-      weight_g REAL NOT NULL,
-      temp_c REAL,
-      hum_pct REAL,
-      batt_pct REAL,
-      rssi INTEGER,
-      raw TEXT
-    )
-  `);
-});
+let pgPool = null;
+let sqliteDb = null;
 
 app.get("/healthz", (_req, res) => {
   res.json({ ok: true });
@@ -79,6 +67,7 @@ app.get("/api/status", (_req, res) => {
   res.json({
     mqtt_url: MQTT_URL,
     topic: MQTT_TOPIC,
+    db_backend: usePostgres ? "postgres" : "sqlite",
     last: state.last,
     history_len: state.history.length,
   });
@@ -129,32 +118,118 @@ function sanitizeTelemetry(payload) {
   };
 }
 
-db.all(
-  `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw
-   FROM telemetry
-   ORDER BY id DESC
-   LIMIT ?`,
-  [HISTORY_LIMIT],
-  (err, rows) => {
-    if (err) {
-      console.error("[DB] Erreur lecture historique:", err.message);
-      return;
-    }
-    rows.reverse();
-    state.history = rows.map((r) => ({
-      ts: r.ts,
-      packet: r.packet,
-      weight_g: r.weight_g,
-      temp_c: r.temp_c,
-      hum_pct: r.hum_pct,
-      batt_pct: r.batt_pct,
-      rssi: r.rssi,
-      raw: r.raw || "",
-    }));
-    state.last = state.history.length > 0 ? state.history[state.history.length - 1] : null;
-    console.log(`[DB] Historique charge: ${state.history.length}`);
+function normalizeRows(rows) {
+  return rows.map((r) => ({
+    ts: r.ts,
+    packet: r.packet,
+    weight_g: r.weight_g,
+    temp_c: r.temp_c,
+    hum_pct: r.hum_pct,
+    batt_pct: r.batt_pct,
+    rssi: r.rssi,
+    raw: r.raw || "",
+  }));
+}
+
+async function initDb() {
+  if (usePostgres) {
+    pgPool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE === "disable" ? false : { rejectUnauthorized: false },
+    });
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS telemetry (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL,
+        packet INTEGER,
+        weight_g DOUBLE PRECISION NOT NULL,
+        temp_c DOUBLE PRECISION,
+        hum_pct DOUBLE PRECISION,
+        batt_pct DOUBLE PRECISION,
+        rssi INTEGER,
+        raw TEXT
+      )
+    `);
+    return;
   }
-);
+
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  sqliteDb = new sqlite3.Database(DB_PATH);
+  await new Promise((resolve, reject) => {
+    sqliteDb.run(
+      `CREATE TABLE IF NOT EXISTS telemetry (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         ts TEXT NOT NULL,
+         packet INTEGER,
+         weight_g REAL NOT NULL,
+         temp_c REAL,
+         hum_pct REAL,
+         batt_pct REAL,
+         rssi INTEGER,
+         raw TEXT
+       )`,
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
+
+async function loadHistory() {
+  if (usePostgres) {
+    const rs = await pgPool.query(
+      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw
+       FROM telemetry
+       ORDER BY id DESC
+       LIMIT $1`,
+      [HISTORY_LIMIT]
+    );
+    return normalizeRows(rs.rows.reverse());
+  }
+
+  const rows = await new Promise((resolve, reject) => {
+    sqliteDb.all(
+      `SELECT ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw
+       FROM telemetry
+       ORDER BY id DESC
+       LIMIT ?`,
+      [HISTORY_LIMIT],
+      (err, data) => (err ? reject(err) : resolve(data))
+    );
+  });
+  return normalizeRows(rows.reverse());
+}
+
+async function saveTelemetry(row) {
+  if (usePostgres) {
+    await pgPool.query(
+      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.raw]
+    );
+    await pgPool.query(
+      `DELETE FROM telemetry
+       WHERE id NOT IN (SELECT id FROM telemetry ORDER BY id DESC LIMIT $1)`,
+      [HISTORY_LIMIT]
+    );
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    sqliteDb.run(
+      `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.raw],
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+  await new Promise((resolve, reject) => {
+    sqliteDb.run(
+      `DELETE FROM telemetry
+       WHERE id NOT IN (SELECT id FROM telemetry ORDER BY id DESC LIMIT ?)`,
+      [HISTORY_LIMIT],
+      (err) => (err ? reject(err) : resolve())
+    );
+  });
+}
 
 const mqttClient = mqtt.connect(MQTT_URL, {
   reconnectPeriod: 2000,
@@ -187,19 +262,12 @@ mqttClient.on("message", (_topic, buffer) => {
 
   state.last = row;
   state.history.push(row);
-  if (state.history.length > 2000) {
+  if (state.history.length > HISTORY_LIMIT) {
     state.history.splice(0, state.history.length - HISTORY_LIMIT);
   }
-  db.run(
-    `INSERT INTO telemetry (ts, packet, weight_g, temp_c, hum_pct, batt_pct, rssi, raw)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [row.ts, row.packet, row.weight_g, row.temp_c, row.hum_pct, row.batt_pct, row.rssi, row.raw]
-  );
-  db.run(
-    `DELETE FROM telemetry
-     WHERE id NOT IN (SELECT id FROM telemetry ORDER BY id DESC LIMIT ?)`,
-    [HISTORY_LIMIT]
-  );
+  saveTelemetry(row).catch((err) => {
+    console.error("[DB] Erreur sauvegarde:", err.message);
+  });
 
   io.emit("telemetry", row);
 });
@@ -210,6 +278,17 @@ io.on("connection", (socket) => {
     history: state.history,
   });
 });
+
+initDb()
+  .then(() => loadHistory())
+  .then((history) => {
+    state.history = history;
+    state.last = history.length > 0 ? history[history.length - 1] : null;
+    console.log(`[DB] Backend=${usePostgres ? "postgres" : "sqlite"} historique=${history.length}`);
+  })
+  .catch((err) => {
+    console.error("[DB] Initialisation erreur:", err.message);
+  });
 
 server.listen(HTTPS_PORT, () => {
   if (httpsEnabled) {

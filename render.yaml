@@ -17,3 +17,5 @@ services:
         sync: false
       - key: HISTORY_LIMIT
         value: "2000"
+      - key: DATABASE_URL
+        sync: false
