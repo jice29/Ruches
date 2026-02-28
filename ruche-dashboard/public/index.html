@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ruche Live</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+      :root {
+        --bg: #f4f1e9;
+        --card: #fffdf7;
+        --ink: #1f1f1b;
+        --muted: #6a685f;
+        --accent: #b66c2f;
+        --accent2: #2f6b5b;
+        --line: #e1dac8;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at top right, #f7efd8, var(--bg) 40%);
+      }
+      .wrap { max-width: 1150px; margin: 20px auto; padding: 0 14px; }
+      .head {
+        display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+      }
+      h1 { margin: 0; font-size: 28px; letter-spacing: .3px; }
+      .status { color: var(--muted); font-size: 14px; }
+      .kpis {
+        margin-top: 12px; display: grid; gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 12px;
+      }
+      .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
+      .val { margin-top: 6px; font-size: 30px; font-weight: 700; line-height: 1; }
+      .charts {
+        margin-top: 12px; display: grid; gap: 10px;
+        grid-template-columns: 1fr;
+      }
+      canvas { width: 100%; height: 220px; }
+      .raw { margin-top: 10px; color: var(--muted); font-size: 13px; word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="head">
+        <h1>Ruche Live</h1>
+        <div class="status" id="status">En attente...</div>
+      </div>
+
+      <div class="kpis">
+        <div class="card"><div class="label">Poids</div><div class="val" id="w">--</div></div>
+        <div class="card"><div class="label">Température</div><div class="val" id="t">--</div></div>
+        <div class="card"><div class="label">Humidité</div><div class="val" id="h">--</div></div>
+        <div class="card"><div class="label">Batterie</div><div class="val" id="b">--</div></div>
+        <div class="card"><div class="label">Signal</div><div class="val" id="r">--</div></div>
+      </div>
+
+      <div class="charts">
+        <div class="card"><canvas id="cw"></canvas></div>
+        <div class="card"><canvas id="ct"></canvas></div>
+        <div class="card"><canvas id="ch"></canvas></div>
+      </div>
+
+      <div class="raw" id="raw">Trame: --</div>
+    </div>
+
+    <script>
+      const MAX_POINTS = 700;
+      const socket = io();
+      const $ = (id) => document.getElementById(id);
+
+      function mkChart(id, label, color, yMin = null, yMax = null) {
+        return new Chart($(id), {
+          type: "line",
+          data: { labels: [], datasets: [{ label, data: [], borderColor: color, borderWidth: 2, pointRadius: 0, tension: 0.2 }] },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+              x: { ticks: { maxTicksLimit: 8 } },
+              y: {
+                min: yMin,
+                max: yMax
+              }
+            }
+          }
+        });
+      }
+
+      const cw = mkChart("cw", "Poids (g)", "#b66c2f", 0, 100000); // 0..100 kg
+      const ct = mkChart("ct", "Temp (C)", "#2f6b5b", -10, 60);
+      const ch = mkChart("ch", "Hum (%)", "#325e88", 0, 100);
+
+      function pushPoint(chart, x, y) {
+        chart.data.labels.push(x);
+        chart.data.datasets[0].data.push(y);
+        if (chart.data.labels.length > MAX_POINTS) {
+          chart.data.labels.shift();
+          chart.data.datasets[0].data.shift();
+        }
+      }
+
+      function applyRow(row) {
+        $("status").textContent = `Dernier paquet: ${row.packet ?? "-"} | ${new Date(row.ts).toLocaleTimeString()}`;
+        $("w").textContent = `${Math.round(row.weight_g)} g`;
+        $("t").textContent = row.temp_c == null ? "--" : `${Math.round(row.temp_c)} C`;
+        $("h").textContent = row.hum_pct == null ? "--" : `${Math.round(row.hum_pct)} %`;
+        $("b").textContent = row.batt_pct == null ? "--" : `${Math.round(row.batt_pct)} %`;
+        $("r").textContent = row.rssi == null ? "--" : `${Math.round(row.rssi)} dBm`;
+        $("raw").textContent = `Trame: ${row.raw || "-"}`;
+
+        const x = new Date(row.ts).toLocaleTimeString();
+        pushPoint(cw, x, row.weight_g);
+        if (row.temp_c != null) pushPoint(ct, x, row.temp_c);
+        if (row.hum_pct != null) pushPoint(ch, x, row.hum_pct);
+      }
+
+      function redraw() {
+        cw.update("none");
+        ct.update("none");
+        ch.update("none");
+      }
+
+      socket.on("bootstrap", (payload) => {
+        const hist = (payload && payload.history) || [];
+        hist.forEach((row) => applyRow(row));
+        redraw();
+      });
+
+      socket.on("telemetry", (row) => {
+        applyRow(row);
+        redraw();
+      });
+    </script>
+  </body>
+  </html>

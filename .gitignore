@@ -1,0 +1,22 @@
+# Node / Dashboard
+node_modules/
+*.log
+.env
+cert/
+*.pfx
+
+# PlatformIO
+**/.pio/
+**/.vscode/
+
+# Secrets
+**/secrets.ini
+**/.env
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.code-workspace
+
+# Build
+*.tmp
