@@ -1,4 +1,4 @@
-/*
+﻿/*
  * RECEPTEUR LoRa - Heltec WiFi LoRa 32 V3
  * Version avec RadioLib - CORRIGEE FINALE
  */
@@ -13,7 +13,6 @@
 #include <Arduino_ConnectionHandler.h>
 #include <PubSubClient.h>
 #include <esp_task_wdt.h>
-#include <string.h>
 
 #ifndef WIFI_SSID_VALUE
 #define WIFI_SSID_VALUE ""
@@ -61,6 +60,9 @@ const char* MQTT_HOST = "broker.hivemq.com";
 const uint16_t MQTT_PORT = 1883;
 const char* MQTT_TOPIC_TELEMETRY = "ruches/telemetry";
 const char* MQTT_TOPIC_ALERT = "ruches/alert";
+const char* MQTT_TOPIC_COMMAND = "ruches/command";
+const char* MQTT_TOPIC_ACK = "ruches/ack";
+const char* LORA_TARGET_NODE_ID = "RUCHE1";
 
 float weight_g = 0.0f;
 float temp_c = 0.0f;
@@ -97,33 +99,32 @@ bool alertSignalLost = false;
 bool alertBatteryLow = false;
 bool prevAlertSignalLost = false;
 bool prevAlertBatteryLow = false;
-TaskHandle_t radioTaskHandle = NULL;
-TaskHandle_t decodeTaskHandle = NULL;
-TaskHandle_t networkTaskHandle = NULL;
-QueueHandle_t loraRawQueue = NULL;
-QueueHandle_t payloadQueue = NULL;
-
-struct LoraRawFrame {
-    char raw[128];
-    int16_t rssi;
-    unsigned long tsMs;
-};
-
-struct DecodedPayload {
-    char raw[128];
-    float weight;
-    float temp;
-    float hum;
-    float batt;
-    int16_t rssi;
-    unsigned long tsMs;
-    uint32_t packetNo;
-};
+String serialLine;
+const unsigned long DISPLAY_REFRESH_MS = 1000;
+const unsigned long OLED_IDLE_SLEEP_MS = 90000;
+bool oledSleeping = false;
+const bool KEEP_OLED_ON_WHEN_USB_SERIAL = true;
+String pendingCmdFrame;
+bool pendingCmdActive = false;
+uint8_t pendingCmdAttempts = 0;
+unsigned long pendingCmdLastTxMs = 0;
+const unsigned long COMMAND_RETRY_MS = 2000;
+const uint8_t COMMAND_MAX_ATTEMPTS = 45;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 WiFiConnectionHandler ArduinoIoTPreferredConnection(WIFI_SSID, WIFI_PASSWORD);
+
+void handleReceivedFrame(const String& received, unsigned long now);
+bool sendLoRaFrame(const String& frame);
+String normalizeCommandFrame(const String& payloadText);
+void processLocalCommand(String line);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void publishTelemetryMqtt(const String& rawPayload);
+void setOledSleep(bool sleepOn);
+bool isUsbSerialActive();
+void queueCommandFrame(const String& frame);
 
 void initProperties() {
     ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
@@ -134,10 +135,6 @@ void initProperties() {
     ArduinoCloud.addProperty(batt_pct, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
     ArduinoCloud.addProperty(rssi_dbm, READ, CLOUD_UPDATE_INTERVAL_S, NULL);
 }
-
-void taskRadio(void* parameter);
-void taskDecode(void* parameter);
-void taskNetwork(void* parameter);
 
 void setFlag() {
     receivedFlag = true;
@@ -268,13 +265,13 @@ bool initOLED() {
     
     pinMode(VEXT_PIN, OUTPUT);
     digitalWrite(VEXT_PIN, LOW);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    delay(100);
     
     pinMode(OLED_RST, OUTPUT);
     digitalWrite(OLED_RST, LOW);
-    vTaskDelay(pdMS_TO_TICKS(20));
+    delay(20);
     digitalWrite(OLED_RST, HIGH);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    delay(50);
     
     Wire.begin(OLED_SDA, OLED_SCL);
     
@@ -295,7 +292,7 @@ bool initOLED() {
 }
 
 void updateDisplay() {
-    if (!oled_working) return;
+    if (!oled_working || oledSleeping) return;
     
     oled.clearDisplay();
     oled.setTextColor(SSD1306_WHITE);
@@ -306,8 +303,13 @@ void updateDisplay() {
     oled.print("P:");
     float displayWeight = lastWeight;
     if (displayWeight < 0) displayWeight = -displayWeight;
-    oled.print(displayWeight, 0);
-    oled.print("g");
+    if (displayWeight >= 1000.0f) {
+        oled.print(displayWeight / 1000.0f, 3);
+        oled.print("kg");
+    } else {
+        oled.print(displayWeight, 0);
+        oled.print("g");
+    }
 
     oled.setCursor(0, 22);
     oled.print("T:");
@@ -358,6 +360,160 @@ float parseFieldValue(const String& payload, const String& key, float fallback) 
     return token.toFloat();
 }
 
+void setOledSleep(bool sleepOn) {
+    if (!oled_working) return;
+    if (sleepOn && isUsbSerialActive() && KEEP_OLED_ON_WHEN_USB_SERIAL) return;
+    if (sleepOn == oledSleeping) return;
+    oled.ssd1306_command(sleepOn ? SSD1306_DISPLAYOFF : SSD1306_DISPLAYON);
+    oledSleeping = sleepOn;
+}
+
+bool isUsbSerialActive() {
+    return (bool)Serial;
+}
+
+bool sendLoRaFrame(const String& frame) {
+    String out = frame;
+    out.trim();
+    if (out.length() == 0) return false;
+
+    Serial.print("Commande LoRa TX: ");
+    Serial.println(out);
+
+    int state = radio.transmit(out.c_str());
+    radio_receiveMode = false;
+    ensureReceiveMode();
+
+    if (state == RADIOLIB_ERR_NONE) {
+        Serial.println("Commande LoRa envoyee");
+        return true;
+    }
+
+    Serial.print("Erreur envoi commande LoRa: ");
+    Serial.println(state);
+    return false;
+}
+
+void queueCommandFrame(const String& frame) {
+    pendingCmdFrame = frame;
+    pendingCmdActive = true;
+    pendingCmdAttempts = 0;
+    pendingCmdLastTxMs = 0;
+}
+
+String normalizeCommandFrame(const String& payloadText) {
+    String cmd = payloadText;
+    cmd.trim();
+    if (cmd.length() == 0) return "";
+
+    if (cmd.startsWith("CMD:")) {
+        return cmd;
+    }
+    if (cmd.equalsIgnoreCase("TARE") || cmd.startsWith("CAL:")) {
+        return "CMD:" + String(LORA_TARGET_NODE_ID) + ":" + cmd;
+    }
+    if (cmd.startsWith("cal") || cmd.startsWith("CAL")) {
+        String mass = cmd.substring(3);
+        mass.trim();
+        if (mass.length() > 0) {
+            return "CMD:" + String(LORA_TARGET_NODE_ID) + ":CAL:" + mass;
+        }
+    }
+
+    int sep = cmd.indexOf(':');
+    if (sep > 0) {
+        String rhs = cmd.substring(sep + 1);
+        if (rhs.equalsIgnoreCase("TARE") || rhs.startsWith("CAL:")) {
+            return "CMD:" + cmd;
+        }
+    }
+
+    return "";
+}
+
+void processLocalCommand(String line) {
+    line.trim();
+    if (line.length() == 0) return;
+
+    if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("h")) {
+        Serial.println("Commandes RX: tare | cal:500 | RUCHE1:TARE | CMD:RUCHE1:CAL:500");
+        return;
+    }
+
+    String frame = normalizeCommandFrame(line);
+    if (frame.length() == 0) {
+        Serial.println("Commande invalide. Exemple: tare ou cal:500");
+        return;
+    }
+    queueCommandFrame(frame);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    if (topic == nullptr || payload == nullptr || length == 0) return;
+    String topicStr(topic);
+    if (topicStr != MQTT_TOPIC_COMMAND) return;
+
+    String body;
+    body.reserve(length + 1);
+    for (unsigned int i = 0; i < length; i++) {
+        body += (char)payload[i];
+    }
+    body.trim();
+
+    String frame = normalizeCommandFrame(body);
+    if (frame.length() == 0) {
+        Serial.print("MQTT commande invalide: ");
+        Serial.println(body);
+        return;
+    }
+    queueCommandFrame(frame);
+}
+
+void handleReceivedFrame(const String& received, unsigned long now) {
+    setOledSleep(false);
+    if (received.startsWith("ACK:")) {
+        Serial.print("ACK recu: ");
+        Serial.println(received);
+        pendingCmdActive = false;
+        pendingCmdFrame = "";
+        pendingCmdAttempts = 0;
+        if (mqttClient.connected()) {
+            mqttClient.publish(MQTT_TOPIC_ACK, received.c_str(), false);
+        }
+        return;
+    }
+
+    int idx = received.indexOf("POIDS_G:");
+    int offset = 8;
+    if (idx < 0) {
+        idx = received.indexOf("POIDS:");
+        offset = 6;
+    }
+    if (idx >= 0) {
+        lastWeight = received.substring(idx + offset).toFloat();
+        Serial.print("Poids recu: ");
+        Serial.print(lastWeight, 2);
+        Serial.println(" g");
+    }
+    lastTempC = parseFieldValue(received, "T_C:", lastTempC);
+    lastHumPct = parseFieldValue(received, "H_P:", lastHumPct);
+    lastBattPct = parseFieldValue(received, "B_P:", lastBattPct);
+    weight_g = lastWeight;
+    temp_c = isnan(lastTempC) ? temp_c : lastTempC;
+    hum_pct = isnan(lastHumPct) ? hum_pct : lastHumPct;
+    batt_pct = (lastBattPct < 0.0f) ? batt_pct : lastBattPct;
+    rssi_dbm = (int)lastRSSI;
+    lastLoraPacketMs = now;
+    publishTelemetryMqtt(received);
+
+    Serial.print("Paquet #");
+    Serial.print(packetCount);
+    Serial.print(": ");
+    Serial.println(received);
+
+    updateDisplay();
+}
+
 void ensureMqtt() {
     if (mqttClient.connected()) {
         if (!mqttInfoPrinted) {
@@ -381,13 +537,16 @@ void ensureMqtt() {
         Serial.print(MQTT_HOST);
         Serial.print(":");
         Serial.println(MQTT_PORT);
+        mqttClient.subscribe(MQTT_TOPIC_COMMAND);
+        Serial.print("MQTT subscribe ");
+        Serial.println(MQTT_TOPIC_COMMAND);
     } else {
         Serial.print("MQTT echec state=");
         Serial.println(mqttClient.state());
     }
 }
 
-void publishTelemetryMqtt(const char* rawPayload) {
+void publishTelemetryMqtt(const String& rawPayload) {
     if (!mqttClient.connected()) return;
 
     char json[320];
@@ -406,7 +565,7 @@ void publishTelemetryMqtt(const char* rawPayload) {
         alertSignalLost ? 1 : 0,
         alertBatteryLow ? 1 : 0,
         lastLoraAgeSec,
-        (rawPayload == NULL) ? "" : rawPayload
+        rawPayload.c_str()
     );
     if (n <= 0 || n >= (int)sizeof(json)) return;
 
@@ -419,9 +578,9 @@ bool initLoRa() {
     
     pinMode(LORA_RST, OUTPUT);
     digitalWrite(LORA_RST, LOW);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    delay(10);
     digitalWrite(LORA_RST, HIGH);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    delay(100);
     
     SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
     
@@ -462,7 +621,7 @@ bool initLoRa() {
 // ===== Setup =====
 void setup() {
     Serial.begin(115200);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    delay(1000);
     
     Serial.println("\n================================");
     Serial.println("RECEPTEUR LORA - RADIOLIB V5");
@@ -484,182 +643,157 @@ void setup() {
         ArduinoCloud.printDebugInfo();
         cloudEnabled = true;
         Serial.println("Arduino Cloud actif.");
-        mqttClient.setServer(MQTT_HOST, MQTT_PORT);
     }
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCallback(mqttCallback);
     
     oled_working = initOLED();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    delay(500);
     
     if (!initLoRa()) {
         Serial.println("ERREUR LORA");
         while(1) {
             digitalWrite(LED_BUILTIN, HIGH);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            delay(100);
             digitalWrite(LED_BUILTIN, LOW);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            delay(100);
         }
     }
     
-    loraRawQueue = xQueueCreate(16, sizeof(LoraRawFrame));
-    payloadQueue = xQueueCreate(16, sizeof(DecodedPayload));
-    if (loraRawQueue == NULL || payloadQueue == NULL) {
-        Serial.println("ERREUR creation queues");
-        while (true) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-
-    xTaskCreatePinnedToCore(taskRadio, "task_radio", 6144, NULL, 4, &radioTaskHandle, 1);
-    xTaskCreatePinnedToCore(taskDecode, "task_decode", 6144, NULL, 3, &decodeTaskHandle, 1);
-    xTaskCreatePinnedToCore(taskNetwork, "task_network", 8192, NULL, 2, &networkTaskHandle, 1);
-
-    Serial.println("\n=== EN ATTENTE ===\n");
+    Serial.println("\n=== EN ATTENTE ===");
+    Serial.println("Commandes serie: tare | cal:500 | help");
+    Serial.println("==================\n");
     updateDisplay();
-}
-
-void taskRadio(void* parameter) {
-    (void)parameter;
-    while (true) {
-        bool shouldRead = false;
-        if (receivedFlag) {
-            receivedFlag = false;
-            shouldRead = true;
-        } else {
-            int irq = radio.getIrqStatus();
-            if ((irq > 0) && (irq & RADIOLIB_SX126X_IRQ_RX_DONE)) {
-                shouldRead = true;
-            }
-        }
-
-        if (shouldRead) {
-            String received;
-            int state = radio.readData(received);
-            if (state == RADIOLIB_ERR_NONE) {
-                LoraRawFrame frame;
-                memset(&frame, 0, sizeof(frame));
-                strncpy(frame.raw, received.c_str(), sizeof(frame.raw) - 1);
-                frame.rssi = radio.getRSSI();
-                frame.tsMs = millis();
-                if (xQueueSend(loraRawQueue, &frame, 0) != pdPASS) {
-                    receiveErrorCount++;
-                }
-            }
-            radio_receiveMode = false;
-            ensureReceiveMode();
-        }
-
-        if (!radio_receiveMode) {
-            ensureReceiveMode();
-        }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-}
-
-void taskDecode(void* parameter) {
-    (void)parameter;
-    LoraRawFrame frame;
-    while (true) {
-        if (xQueueReceive(loraRawQueue, &frame, portMAX_DELAY) == pdTRUE) {
-            String received(frame.raw);
-            packetCount++;
-            lastLoraPacketMs = frame.tsMs;
-            lastRSSI = frame.rssi;
-
-            int idx = received.indexOf("POIDS_G:");
-            int offset = 8;
-            if (idx < 0) {
-                idx = received.indexOf("POIDS:");
-                offset = 6;
-            }
-            if (idx >= 0) {
-                lastWeight = received.substring(idx + offset).toFloat();
-                Serial.print("Poids recu: ");
-                Serial.print(lastWeight, 2);
-                Serial.println(" g");
-            }
-            lastTempC = parseFieldValue(received, "T_C:", lastTempC);
-            lastHumPct = parseFieldValue(received, "H_P:", lastHumPct);
-            lastBattPct = parseFieldValue(received, "B_P:", lastBattPct);
-            weight_g = lastWeight;
-            temp_c = isnan(lastTempC) ? temp_c : lastTempC;
-            hum_pct = isnan(lastHumPct) ? hum_pct : lastHumPct;
-            batt_pct = (lastBattPct < 0.0f) ? batt_pct : lastBattPct;
-            rssi_dbm = (int)lastRSSI;
-
-            DecodedPayload payload;
-            memset(&payload, 0, sizeof(payload));
-            strncpy(payload.raw, frame.raw, sizeof(payload.raw) - 1);
-            payload.weight = lastWeight;
-            payload.temp = lastTempC;
-            payload.hum = lastHumPct;
-            payload.batt = lastBattPct;
-            payload.rssi = lastRSSI;
-            payload.tsMs = frame.tsMs;
-            payload.packetNo = packetCount;
-            (void)xQueueSend(payloadQueue, &payload, 0);
-
-            Serial.print("Paquet #");
-            Serial.print(packetCount);
-            Serial.print(": ");
-            Serial.println(received);
-        }
-    }
-}
-
-void taskNetwork(void* parameter) {
-    (void)parameter;
-    DecodedPayload payload;
-    while (true) {
-        unsigned long now = millis();
-        ensureWiFiConnection();
-
-        if (cloudEnabled) {
-            ArduinoCloud.update();
-            ensureMqtt();
-            mqttClient.loop();
-            if (WiFi.status() == WL_CONNECTED && !wifiInfoPrinted) {
-                Serial.print("WiFi OK IP=");
-                Serial.print(WiFi.localIP());
-                Serial.print(" RSSI=");
-                Serial.println(WiFi.RSSI());
-                wifiInfoPrinted = true;
-            } else if (WiFi.status() != WL_CONNECTED) {
-                wifiInfoPrinted = false;
-            }
-        }
-
-        while (xQueueReceive(payloadQueue, &payload, 0) == pdTRUE) {
-            publishTelemetryMqtt(payload.raw);
-        }
-
-        updateAlertStates(now);
-
-        if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
-            lastHealthyNetworkMs = now;
-        }
-        if (lastHealthyNetworkMs > 0 && (now - lastHealthyNetworkMs) > NETWORK_STALL_RESTART_MS) {
-            Serial.println("Redemarrage securite reseau (stall > 5 min)...");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            ESP.restart();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
 }
 
 // ===== Loop =====
 void loop() {
-    static unsigned long lastDisplay = 0;
     unsigned long now = millis();
     esp_task_wdt_reset();
 
-    if (now - lastDisplay > 200) {
-        lastDisplay = now;
-        updateDisplay();
+    ensureWiFiConnection();
+    updateAlertStates(now);
+
+    if (cloudEnabled) {
+        ArduinoCloud.update();
+    }
+    ensureMqtt();
+    mqttClient.loop();
+    if (WiFi.status() == WL_CONNECTED && !wifiInfoPrinted) {
+        Serial.print("WiFi OK IP=");
+        Serial.print(WiFi.localIP());
+        Serial.print(" RSSI=");
+        Serial.println(WiFi.RSSI());
+        wifiInfoPrinted = true;
+    } else if (WiFi.status() != WL_CONNECTED) {
+        wifiInfoPrinted = false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
+        lastHealthyNetworkMs = now;
+    }
+    if (lastHealthyNetworkMs > 0 && (now - lastHealthyNetworkMs) > NETWORK_STALL_RESTART_MS) {
+        Serial.println("Redemarrage securite reseau (stall > 5 min)...");
+        delay(100);
+        ESP.restart();
+    }
+    
+    while (Serial.available() > 0) {
+        char ch = Serial.read();
+        if (ch == '\n' || ch == '\r') {
+            if (serialLine.length() > 0) {
+                processLocalCommand(serialLine);
+                serialLine = "";
+            }
+        } else if (isPrintable(ch) && serialLine.length() < 64) {
+            serialLine += ch;
+        }
+    }
+
+    if (pendingCmdActive) {
+        if (pendingCmdAttempts == 0 || (now - pendingCmdLastTxMs) >= COMMAND_RETRY_MS) {
+            bool ok = sendLoRaFrame(pendingCmdFrame);
+            pendingCmdLastTxMs = now;
+            pendingCmdAttempts++;
+            if (ok) {
+                Serial.print("Commande en attente ACK, tentative ");
+                Serial.print(pendingCmdAttempts);
+                Serial.print("/");
+                Serial.println(COMMAND_MAX_ATTEMPTS);
+            }
+            if (pendingCmdAttempts >= COMMAND_MAX_ATTEMPTS) {
+                Serial.println("Commande abandonnee: aucun ACK");
+                pendingCmdActive = false;
+                pendingCmdFrame = "";
+                pendingCmdAttempts = 0;
+            }
+        }
+    }
+
+    // POLLING toutes les 100ms
+    if (now - lastReceiveCheck > 100) {
+        lastReceiveCheck = now;
+        
+        // Via interruption
+        if (receivedFlag) {
+            receivedFlag = false;
+            
+            String received;
+            int state = radio.readData(received);
+            
+            if (state == RADIOLIB_ERR_NONE) {
+                packetCount++;
+                lastRSSI = radio.getRSSI();
+                handleReceivedFrame(received, now);
+            }
+            
+            radio_receiveMode = false;
+            ensureReceiveMode();
+        }
+        
+        // Polling direct
+        int irq = radio.getIrqStatus();
+        if (irq > 0) {
+            if (irq & RADIOLIB_SX126X_IRQ_RX_DONE) {
+                String received;
+                int state = radio.readData(received);
+                
+                if (state == RADIOLIB_ERR_NONE) {
+                    packetCount++;
+                    lastRSSI = radio.getRSSI();
+                    handleReceivedFrame(received, now);
+                }
+                
+                radio_receiveMode = false;
+                ensureReceiveMode();
+            }
+        }
+    }
+    
+    // Verification periodique
+    static unsigned long lastCheckMode = 0;
+    if (now - lastCheckMode > 2000) {
+        lastCheckMode = now;
+        
+        if (!radio_receiveMode) {
+            ensureReceiveMode();
+        }
+    }
+    
+    // Mise a jour affichage
+    static unsigned long lastDisplay = 0;
+    if (now - lastDisplay > DISPLAY_REFRESH_MS) {
+        lastDisplay = now;
+        updateAlertStates(now);
+        if ((lastLoraPacketMs > 0) && ((now - lastLoraPacketMs) > OLED_IDLE_SLEEP_MS) && !alertSignalLost) {
+            setOledSleep(true);
+        }
+        updateDisplay();
+    }
+    
+    delay(5);
 }
+
 
 
 
