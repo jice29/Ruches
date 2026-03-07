@@ -14,7 +14,6 @@
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
 #include <esp_sleep.h>
-#include <WiFi.h>
 #include <limits.h>
 #include <ctype.h>
 #include <string.h>
@@ -38,24 +37,19 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // ===== Mode economie d'energie =====
 const bool LOW_POWER_MODE = true;
-const uint8_t LOW_POWER_WAKE_MIN = 15;         // conserve la config nominale (minutes)
-const uint32_t LOW_POWER_SLEEP_S = 10;         // DEBUG: reveil toutes les 10 secondes
+const uint32_t LOW_POWER_SLEEP_S = 60;         // reveil periodique
 const uint32_t LOW_POWER_ACTIVE_WINDOW_MS = 12000; // fenetre de mesure avant envoi
 const bool KEEP_AWAKE_WHEN_USB_SERIAL = true;
+const uint32_t CALIBRATION_COMMAND_WINDOW_MS = 120000;
+const uint32_t CALIBRATION_WAIT_TIMEOUT_MS = 20000;
+const uint32_t CALIBRATION_POLL_MS = 200;
+const float CALIBRATION_MIN_DELTA_G = 20.0f;
+const float CALIBRATION_STABLE_BAND_G = 12.0f;
+const uint8_t CALIBRATION_STABLE_POLLS = 5;
 const uint32_t STARTUP_SETTLE_IGNORE_MS = 5000;
 const uint32_t STARTUP_FORCE_SEND_MS = 25000;
 const uint8_t STARTUP_STABLE_SAMPLES = 12;
 const float STARTUP_STABLE_SPAN_G = 18.0f;
-const float WEIGHT_EMA_ALPHA_OPT = 0.02f;      // configurable
-const float WEIGHT_TEMP_COEFF = 0.30f;         // g / degC, configurable
-const float SEND_DELTA_THRESHOLD_G = 10.0f;    // anti-envoi inutile
-const uint16_t SEND_MAX_INTERVAL_MIN = 30;     // envoi de securite
-const unsigned long DEBUG_TX_INTERVAL_MS = 2000;
-const uint8_t HX711_SAMPLE_COUNT = 30;
-const uint8_t HX711_TRIM_PERCENT = 20;
-const uint16_t HX711_WAKE_SETTLE_MS = 200;
-const uint16_t HX711_RATE_MS = 100;            // 10 Hz
-const uint16_t HX711_MEASURE_PERIOD_MS = 2000;
 
 // ===== Configuration batterie (Heltec V3) =====
 // Ajuster ces broches si votre revision de carte differe.
@@ -110,9 +104,6 @@ float lastTempC = NAN;
 float lastHumPct = NAN;
 unsigned long lastDhtReadMs = 0;
 const unsigned long DHT_READ_INTERVAL_MS = 10000;
-const unsigned long DHT_RETRY_ON_FAIL_MS = 2500;
-const unsigned long DHT_WARMUP_MS = 2500;
-unsigned long dhtBeginMs = 0;
 float batteryVoltage = NAN;
 int batteryPercent = -1;
 bool batteryChargingLikely = false;
@@ -129,6 +120,7 @@ volatile bool loraRxFlag = false;
 bool radioReceiveMode = false;
 bool lowPowerFrameSent = false;
 unsigned long bootMs = 0;
+unsigned long calibrationCommandWindowUntilMs = 0;
 bool startupReady = false;
 float startupBuf[STARTUP_STABLE_SAMPLES];
 uint8_t startupBufCount = 0;
@@ -138,17 +130,18 @@ bool lastSentWeightReady = false;
 bool forceFastSend = false;
 float calibrationBaseWeight = 0.0f;
 bool calibrationBaseReady = false;
-bool telemetryCycleDone = false;
+bool calibrationPending = false;
+float calibrationKnownMass = 0.0f;
+unsigned long calibrationPendingSinceMs = 0;
+float calibrationLastDelta = 0.0f;
+float calibrationMaxDelta = 0.0f;
+uint8_t calibrationStableCount = 0;
 SemaphoreHandle_t gDataMutex = NULL;
 TaskHandle_t hxTaskHandle = NULL;
 TaskHandle_t dhtTaskHandle = NULL;
 TaskHandle_t loraTaskHandle = NULL;
 char serialLine[32];
 size_t serialLineLen = 0;
-RTC_DATA_ATTR float rtcLastFilteredWeight = NAN;
-RTC_DATA_ATTR float rtcLastSentWeight = NAN;
-RTC_DATA_ATTR uint16_t rtcCyclesSinceLastSend = 0;
-RTC_DATA_ATTR uint32_t rtcBootCount = 0;
 
 bool envoyerPaquet(const char* message);
 void readDhtSensor();
@@ -171,8 +164,7 @@ void processSerialLine(char* line);
 void taskHX711(void* parameter);
 void taskDht(void* parameter);
 void taskLoRa(void* parameter);
-float readWeightOptimized();
-bool shouldSendTelemetry(float weight);
+bool applyCalibrationDelta(float knownMass, float measuredDelta);
 
 // ===== Filtrage HX711 =====
 const uint8_t FILTER_WINDOW_SIZE = 20;
@@ -299,86 +291,6 @@ float filterWeight(float raw) {
     }
 
     return emaWeight;
-}
-
-float readWeightOptimized() {
-    // Coupe HX711 entre acquisitions pour minimiser la conso batterie.
-    LoadCell.powerUp();
-    vTaskDelay(pdMS_TO_TICKS(HX711_WAKE_SETTLE_MS));
-
-    float samples[HX711_SAMPLE_COUNT];
-    uint8_t count = 0;
-    for (uint8_t i = 0; i < HX711_SAMPLE_COUNT; i++) {
-        unsigned long t0 = millis();
-        bool got = false;
-        while ((millis() - t0) < 250) {
-            if (LoadCell.update()) {
-                samples[count++] = LoadCell.getData();
-                got = true;
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-        if (!got) continue;
-        // Cadence mesure 10 Hz.
-        vTaskDelay(pdMS_TO_TICKS(HX711_RATE_MS));
-    }
-
-    if (count < 5) {
-        LoadCell.powerDown();
-        return NAN;
-    }
-
-    for (uint8_t i = 0; i < count; i++) {
-        for (uint8_t j = i + 1; j < count; j++) {
-            if (samples[j] < samples[i]) {
-                float tmp = samples[i];
-                samples[i] = samples[j];
-                samples[j] = tmp;
-            }
-        }
-    }
-
-    uint8_t trim = (uint8_t)((count * HX711_TRIM_PERCENT) / 100U);
-    if ((trim * 2U) >= count) trim = 0;
-    uint8_t begin = trim;
-    uint8_t end = count - trim;
-    float sum = 0.0f;
-    uint8_t used = 0;
-    for (uint8_t i = begin; i < end; i++) {
-        sum += samples[i];
-        used++;
-    }
-    if (used == 0) {
-        LoadCell.powerDown();
-        return NAN;
-    }
-
-    float avg = sum / (float)used;
-    if (!emaReady || isnan(emaWeight)) {
-        emaWeight = avg;
-        emaReady = true;
-    } else {
-        emaWeight += WEIGHT_EMA_ALPHA_OPT * (avg - emaWeight);
-    }
-
-    float corrected = emaWeight;
-    if (!isnan(lastTempC)) {
-        // Compensation thermique simple autour de 20 C.
-        corrected = emaWeight - ((lastTempC - 20.0f) * WEIGHT_TEMP_COEFF);
-    }
-
-    rtcLastFilteredWeight = corrected;
-    LoadCell.powerDown();
-    return corrected;
-}
-
-bool shouldSendTelemetry(float weight) {
-    if (LOW_POWER_SLEEP_S <= 10) return true; // mode debug: envoi a chaque reveil
-    if (isnan(rtcLastSentWeight)) return true;
-    if (fabs(weight - rtcLastSentWeight) > SEND_DELTA_THRESHOLD_G) return true;
-    if (((uint32_t)rtcCyclesSinceLastSend * (uint32_t)LOW_POWER_SLEEP_S) >= ((uint32_t)SEND_MAX_INTERVAL_MIN * 60U)) return true;
-    return false;
 }
 
 uint8_t battToBars(int battPct) {
@@ -529,9 +441,7 @@ void updateDisplay() {
 
 void readDhtSensor() {
     unsigned long now = millis();
-    if ((now - dhtBeginMs) < DHT_WARMUP_MS) return;
-    unsigned long intervalMs = (isnan(lastTempC) || isnan(lastHumPct)) ? DHT_RETRY_ON_FAIL_MS : DHT_READ_INTERVAL_MS;
-    if (now - lastDhtReadMs < intervalMs) return;
+    if (now - lastDhtReadMs < DHT_READ_INTERVAL_MS) return;
     lastDhtReadMs = now;
 
     float h = dht.readHumidity();
@@ -677,30 +587,7 @@ void saveTareOffset(long tareOffset) {
     EEPROM.commit();
 }
 
-bool performCalibrationWithMass(float knownMass) {
-    if (knownMass <= 0.0f) {
-        Serial.println("Masse invalide. Exemple: c500");
-        return false;
-    }
-
-    // Calibrage terrain: on ajoute une masse connue sur la ruche deja en place.
-    // Utilise le delta de poids entre "avant" et "apres ajout".
-    if (!calibrationBaseReady) {
-        Serial.println("Calib: base absente. Utiliser 'c' puis poser la masse.");
-        displayMessage("Calib KO", "Base absente");
-        return false;
-    }
-
-    float currentWeight = stableWeight;
-    float measuredDelta = fabs(currentWeight - calibrationBaseWeight);
-    calibrationBaseReady = false;
-
-    if (measuredDelta < 20.0f) {
-        Serial.println("Calib KO: delta trop faible");
-        displayMessage("Calib KO", "Delta trop faible");
-        return false;
-    }
-
+bool applyCalibrationDelta(float knownMass, float measuredDelta) {
     float ratio = measuredDelta / knownMass;
     float newCal = currentCalFactor * ratio;
     if (isnan(newCal) || isinf(newCal) || newCal == 0.0f) {
@@ -737,6 +624,26 @@ bool performCalibrationWithMass(float knownMass) {
     snprintf(calMsg, sizeof(calMsg), "%.2f", currentCalFactor);
     displayMessage("Calib OK", calMsg);
     return true;
+}
+
+bool performCalibrationWithMass(float knownMass) {
+    if (knownMass <= 0.0f) {
+        Serial.println("Masse invalide. Exemple: c500");
+        return false;
+    }
+    if (!calibrationBaseReady) {
+        Serial.println("Calib: base absente. Utiliser 'c' puis poser la masse.");
+        displayMessage("Calib KO", "Base absente");
+        return false;
+    }
+    float measuredDelta = fabs(stableWeight - calibrationBaseWeight);
+    calibrationBaseReady = false;
+    if (measuredDelta < CALIBRATION_MIN_DELTA_G) {
+        Serial.println("Calib KO: delta trop faible");
+        displayMessage("Calib KO", "Delta trop faible");
+        return false;
+    }
+    return applyCalibrationDelta(knownMass, measuredDelta);
 }
 
 bool performLegacyCalibrationWithMass(float knownMass) {
@@ -812,13 +719,9 @@ void enterDeepSleep() {
     }
 
     digitalWrite(BAT_ADC_EN_PIN, HIGH);
-    LoadCell.powerDown();
     radio.sleep();
-    WiFi.mode(WIFI_OFF);
     SPI.end();
-    // Reveil periodique + reveil bouton PRG pour tare locale.
     esp_sleep_enable_timer_wakeup((uint64_t)LOW_POWER_SLEEP_S * 1000000ULL);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON_PIN, 0);
     esp_deep_sleep_start();
 }
 
@@ -895,6 +798,7 @@ void handleLoRaCommand(const char* message) {
         if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
             calibrationBaseWeight = stableWeight;
             calibrationBaseReady = true;
+            calibrationCommandWindowUntilMs = millis() + CALIBRATION_COMMAND_WINDOW_MS;
             xSemaphoreGive(gDataMutex);
         }
         Serial.print("Commande LoRa: CAL_START base=");
@@ -911,12 +815,26 @@ void handleLoRaCommand(const char* message) {
         bool ok = false;
         if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
             if (calibrationBaseReady) {
-                ok = performCalibrationWithMass(knownMass);
+                calibrationPending = true;
+                calibrationKnownMass = knownMass;
+                calibrationPendingSinceMs = millis();
+                calibrationLastDelta = 0.0f;
+                calibrationMaxDelta = 0.0f;
+                calibrationStableCount = 0;
+                ok = true;
             } else {
                 // Fallback pour compatibilite dashboard existant (commande unique).
                 ok = performLegacyCalibrationWithMass(knownMass);
             }
+            if (!calibrationPending) {
+                calibrationCommandWindowUntilMs = 0;
+            }
             xSemaphoreGive(gDataMutex);
+        }
+        if (calibrationPending) {
+            Serial.print("Commande LoRa: CAL attente stabilisation masse=");
+            Serial.println(knownMass, 2);
+            return;
         }
         char ack[80];
         if (ok) {
@@ -947,10 +865,7 @@ void processSerialLine(char* line) {
         }
 
         bool calOk = false;
-        if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
-            calOk = performCalibrationWithMass(knownMass);
-            xSemaphoreGive(gDataMutex);
-        }
+        calOk = performCalibrationWithMass(knownMass);
         if (!calOk) {
             waitingKnownMass = false;
             return;
@@ -975,11 +890,7 @@ void processSerialLine(char* line) {
                 char* massToken = trimInPlace(pLine + 1);
                 if (massToken[0] != '\0') {
                     float knownMass = strtof(massToken, NULL);
-                    bool calOk = false;
-                    if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
-                        calOk = performCalibrationWithMass(knownMass);
-                        xSemaphoreGive(gDataMutex);
-                    }
+                    bool calOk = performCalibrationWithMass(knownMass);
                     if (!calOk) {
                         Serial.println("Usage: c500  (ou c puis 500)");
                     }
@@ -1037,23 +948,10 @@ bool initHX711() {
     
     currentCalFactor = calVal;
     LoadCell.setCalFactor(currentCalFactor);
-    uint32_t magic = 0;
-    long storedTareOffset = 0;
-    EEPROM.get(eepromMagic_eepromAdress, magic);
-    if (magic == EEPROM_MAGIC) {
-        EEPROM.get(tareOffset_eepromAdress, storedTareOffset);
-        if (storedTareOffset != LONG_MIN && storedTareOffset != LONG_MAX) {
-            LoadCell.setTareOffset(storedTareOffset);
-            Serial.print(" tareOfs=");
-            Serial.print(storedTareOffset);
-        }
-    } else {
-        Serial.print(" tareOfs=none");
-    }
-    // Une mesure brute par cycle, le lissage est gere en logiciel optimise.
-    LoadCell.setSamplesInUse(1);
+    Serial.print(" tareOfs=ignored");
+    // Plus de lissage natif HX711 pour fiabiliser le debut de mesure.
+    LoadCell.setSamplesInUse(32);
     LoadCell.refreshDataSet();
-    LoadCell.powerDown();
     Serial.print("OK, cal=");
     Serial.println(currentCalFactor, 2);
     
@@ -1118,17 +1016,13 @@ bool envoyerPaquet(const char* message) {
     if (state == RADIOLIB_ERR_NONE) {
         Serial.println("OK");
         packetsSent++;
-        if (!LOW_POWER_MODE || isUsbSerialActive()) {
-            beginLoRaReceive();
-        }
+        beginLoRaReceive();
         return true;
     } else {
         Serial.print("ECHEC Code: ");
         Serial.println(state);
         packetsFailed++;
-        if (!LOW_POWER_MODE || isUsbSerialActive()) {
-            beginLoRaReceive();
-        }
+        beginLoRaReceive();
         return false;
     }
 }
@@ -1161,33 +1055,125 @@ void taskHX711(void* parameter) {
             }
         }
 
-        if (!tareInProgress && (now - lastRead > HX711_MEASURE_PERIOD_MS)) {
-            float optWeight = readWeightOptimized();
-            if (!isnan(optWeight)) {
-                if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
-                    stableWeight = optWeight;
-                    if (fabs(stableWeight) < ZERO_LOCK_G) {
-                        stableWeight = 0.0f;
-                    }
-                    lastWeight = stableWeight;
-                    pushStartupSample(stableWeight);
-                    if (LOW_POWER_MODE && !startupReady) {
-                        // En mode ultra low-power, autorise l'envoi apres 1ere mesure valide.
-                        startupReady = true;
-                    }
-                    if (!startupReady && (now - bootMs) > STARTUP_SETTLE_IGNORE_MS && isStartupStable()) {
-                        startupReady = true;
-                        Serial.println("Startup HX711 stable");
-                    }
-                    xSemaphoreGive(gDataMutex);
+        if (LoadCell.update() && (now - lastRead > 200)) {
+            float rawWeight = LoadCell.getData();
+            float correctedRaw = rawWeight - softwareZeroOffset;
+            if (prevCorrectedRawReady) {
+                float d = fabs(correctedRaw - prevCorrectedRaw);
+                if (fabs(correctedRaw) <= AUTO_ZERO_WINDOW_G && d <= AUTO_ZERO_MAX_STEP_G) {
+                    softwareZeroOffset += AUTO_ZERO_ALPHA * correctedRaw;
+                    correctedRaw = rawWeight - softwareZeroOffset;
                 }
             }
-            lastRead = now;
-        }
+            prevCorrectedRaw = correctedRaw;
+            prevCorrectedRawReady = true;
 
-        if (tareInProgress) {
-            LoadCell.powerUp();
-            (void)LoadCell.update();
+            float medWeight = medianFilter(correctedRaw);
+            float filteredWeight = filterWeight(medWeight);
+
+            if (tareResidualPending) {
+                tareResidualAcc += filteredWeight;
+                tareResidualCount++;
+                if (tareResidualCount >= TARE_RESIDUAL_SAMPLES) {
+                    float residual = tareResidualAcc / tareResidualCount;
+                    softwareZeroOffset += residual;
+                    tareResidualPending = false;
+                    tareResidualAcc = 0.0f;
+                    tareResidualCount = 0;
+                    Serial.print("Compensation residuelle tare: ");
+                    Serial.print(residual, 2);
+                    Serial.println(" g");
+                }
+            }
+
+            if (fabs(filteredWeight - stableWeight) >= DISPLAY_DEADBAND_G) {
+                if (pendingStableCount == 0 || fabs(filteredWeight - pendingStableCandidate) >= DISPLAY_DEADBAND_G) {
+                    pendingStableCandidate = filteredWeight;
+                    pendingStableCount = 1;
+                } else {
+                    pendingStableCount++;
+                    if (pendingStableCount >= STABLE_CONFIRM_SAMPLES) {
+                        stableWeight = pendingStableCandidate;
+                        pendingStableCount = 0;
+                    }
+                }
+            } else {
+                pendingStableCount = 0;
+            }
+            if (fabs(stableWeight) < ZERO_LOCK_G) {
+                stableWeight = 0.0f;
+            }
+
+            float txWeightFiltered = filterTelemetryWeight(stableWeight);
+            if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
+                lastWeight = txWeightFiltered;
+                if (lastSentWeightReady && fabs(stableWeight - lastSentWeight) >= FAST_CHANGE_TRIGGER_G) {
+                    forceFastSend = true;
+                }
+                pushStartupSample(stableWeight);
+                if (!startupReady && (now - bootMs) > STARTUP_SETTLE_IGNORE_MS && isStartupStable()) {
+                    startupReady = true;
+                    telemetryWeight = stableWeight;
+                    telemetryWeightReady = true;
+                    Serial.println("Startup HX711 stable");
+                }
+                minuteWeightSum += (double)txWeightFiltered;
+                minuteWeightCount++;
+                xSemaphoreGive(gDataMutex);
+            }
+
+            bool finishCalibration = false;
+            bool calibrationOk = false;
+            float calibrationMassLocal = 0.0f;
+            float calibrationDeltaLocal = 0.0f;
+            if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
+                if (calibrationPending && calibrationBaseReady) {
+                    float delta = fabs(stableWeight - calibrationBaseWeight);
+                    if (delta > calibrationMaxDelta) calibrationMaxDelta = delta;
+                    if (delta >= CALIBRATION_MIN_DELTA_G) {
+                        if (fabs(delta - calibrationLastDelta) <= CALIBRATION_STABLE_BAND_G) {
+                            calibrationStableCount++;
+                        } else {
+                            calibrationStableCount = 0;
+                        }
+                    } else {
+                        calibrationStableCount = 0;
+                    }
+                    calibrationLastDelta = delta;
+
+                    if (calibrationStableCount >= CALIBRATION_STABLE_POLLS) {
+                        calibrationMassLocal = calibrationKnownMass;
+                        calibrationDeltaLocal = delta;
+                        calibrationPending = false;
+                        calibrationBaseReady = false;
+                        calibrationCommandWindowUntilMs = 0;
+                        finishCalibration = true;
+                        calibrationOk = true;
+                    } else if ((millis() - calibrationPendingSinceMs) >= CALIBRATION_WAIT_TIMEOUT_MS) {
+                        calibrationMassLocal = calibrationKnownMass;
+                        calibrationDeltaLocal = calibrationMaxDelta;
+                        calibrationPending = false;
+                        calibrationBaseReady = false;
+                        calibrationCommandWindowUntilMs = 0;
+                        finishCalibration = true;
+                        calibrationOk = false;
+                    }
+                }
+                xSemaphoreGive(gDataMutex);
+            }
+            if (finishCalibration) {
+                char ack[80];
+                if (calibrationOk && calibrationDeltaLocal >= CALIBRATION_MIN_DELTA_G &&
+                    applyCalibrationDelta(calibrationMassLocal, calibrationDeltaLocal)) {
+                    snprintf(ack, sizeof(ack), "ACK:%s:CAL:OK:%.2f", LORA_NODE_ID, calibrationMassLocal);
+                } else {
+                    Serial.println("Calib KO: delta trop faible");
+                    displayMessage("Calib KO", "Delta trop faible");
+                    snprintf(ack, sizeof(ack), "ACK:%s:CAL:ERR", LORA_NODE_ID);
+                }
+                envoyerPaquet(ack);
+            }
+            lastRead = now;
         }
 
         if (tareInProgress && LoadCell.getTareStatus()) {
@@ -1218,10 +1204,8 @@ void taskHX711(void* parameter) {
                 lastSentWeight = 0.0f;
                 lastSentWeightReady = false;
                 forceFastSend = false;
-                rtcLastFilteredWeight = NAN;
                 xSemaphoreGive(gDataMutex);
             }
-            LoadCell.powerDown();
             Serial.println("Tare terminee");
             displayMessage("Tare OK");
         }
@@ -1243,7 +1227,6 @@ void taskLoRa(void* parameter) {
     (void)parameter;
     while (true) {
         unsigned long now = millis();
-        bool usbActive = isUsbSerialActive();
 
         if (loraRxFlag) {
             loraRxFlag = false;
@@ -1265,34 +1248,40 @@ void taskLoRa(void* parameter) {
         }
 
         bool doSend = false;
+        bool calibrationWindowActive = false;
         bool startupReadyLocal = false;
+        bool forceFastSendLocal = false;
         float sendWeight = 0.0f;
         float tempLocal = NAN;
         float humLocal = NAN;
         int batteryPercentLocal = -1;
 
         if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
+            if (calibrationCommandWindowUntilMs != 0 && (long)(now - calibrationCommandWindowUntilMs) >= 0) {
+                calibrationCommandWindowUntilMs = 0;
+                calibrationBaseReady = false;
+            }
+            calibrationWindowActive = (calibrationCommandWindowUntilMs != 0);
+            forceFastSendLocal = forceFastSend;
             startupReadyLocal = startupReady;
-            bool txReady = startupReady || LOW_POWER_MODE;
-            bool oneShotCycle = LOW_POWER_MODE && !usbActive;
-            unsigned long minTxInterval = (LOW_POWER_SLEEP_S <= 10) ? DEBUG_TX_INTERVAL_MS : (unsigned long)interval;
-            bool txIntervalElapsed = (now - previousMillis) >= minTxInterval;
-            if (((!oneShotCycle) || !telemetryCycleDone) && txReady && txIntervalElapsed && shouldSendTelemetry(lastWeight)) {
+            if (!calibrationWindowActive && (forceFastSend || (now - previousMillis >= interval))) {
                 doSend = true;
                 sendWeight = lastWeight;
                 tempLocal = lastTempC;
                 humLocal = lastHumPct;
                 batteryPercentLocal = batteryPercent;
+                minuteWeightSum = 0.0;
+                minuteWeightCount = 0;
+                forceFastSend = false;
                 lastSentWeight = sendWeight;
                 lastSentWeightReady = true;
-                if (oneShotCycle) telemetryCycleDone = true;
                 previousMillis = now;
             }
             xSemaphoreGive(gDataMutex);
         }
 
         if (doSend) {
-            if (!LOW_POWER_MODE && !startupReadyLocal && (now - bootMs) < STARTUP_FORCE_SEND_MS) {
+            if (!startupReadyLocal && (now - bootMs) < STARTUP_FORCE_SEND_MS) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
@@ -1310,10 +1299,8 @@ void taskLoRa(void* parameter) {
                 snprintf(poidsMsg, sizeof(poidsMsg), "POIDS_G:%.2f", fabs(sendWeight));
             }
             envoyerPaquet(poidsMsg);
-            rtcLastSentWeight = sendWeight;
-            rtcCyclesSinceLastSend = 0;
 
-            if (LOW_POWER_MODE && !usbActive) {
+            if (LOW_POWER_MODE && !lowPowerFrameSent && !isUsbSerialActive()) {
                 lowPowerFrameSent = true;
                 Serial.println("Low power: trame envoyee, passage en deep sleep");
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -1321,13 +1308,15 @@ void taskLoRa(void* parameter) {
             }
         }
 
-        if (LOW_POWER_MODE && !lowPowerFrameSent && !usbActive && (now - bootMs) >= LOW_POWER_ACTIVE_WINDOW_MS) {
-            // Pas de variation significative, on rend la main au deep sleep.
-            Serial.println("Low power: pas de variation utile, deep sleep");
-            enterDeepSleep();
+        if (LOW_POWER_MODE && !lowPowerFrameSent && !isUsbSerialActive() && (now - bootMs) >= LOW_POWER_ACTIVE_WINDOW_MS) {
+            previousMillis = now - interval;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        if (forceFastSendLocal) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
     }
 }
 
@@ -1335,18 +1324,12 @@ void setup() {
     Serial.begin(115200);
     vTaskDelay(pdMS_TO_TICKS(1000));
     dht.begin();
-    dhtBeginMs = millis();
-    lastDhtReadMs = dhtBeginMs - DHT_READ_INTERVAL_MS; // autorise une lecture rapide apres warmup
-    WiFi.mode(WIFI_OFF);
     pinMode(BAT_ADC_EN_PIN, OUTPUT);
     digitalWrite(BAT_ADC_EN_PIN, HIGH);
     analogReadResolution(12);
     analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
     pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
     bootMs = millis();
-    rtcBootCount++;
-    if (rtcCyclesSinceLastSend < 65000U) rtcCyclesSinceLastSend++;
-    bool wakeByPrgButton = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
 
     Serial.println("\n================================");
     Serial.println("BALANCE LORA - RADIOLIB V2");
@@ -1355,22 +1338,11 @@ void setup() {
         Serial.println("Mode: LOW POWER");
         if (isUsbSerialActive()) {
             Serial.println("USB detecte: deep sleep suspendu");
-        } else {
-            Serial.print("Wake periodique: ");
-            Serial.print(LOW_POWER_WAKE_MIN);
-            Serial.println(" min");
         }
     }
 
-    bool useDisplay = (!LOW_POWER_MODE || isUsbSerialActive());
-    if (useDisplay) {
-        oled_working = initOLED();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    } else {
-        oled_working = false;
-        pinMode(VEXT_PIN, OUTPUT);
-        digitalWrite(VEXT_PIN, HIGH);
-    }
+    oled_working = initOLED();
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     if (!initHX711()) {
         Serial.println("ERREUR HX711");
@@ -1383,13 +1355,6 @@ void setup() {
         }
     }
     vTaskDelay(pdMS_TO_TICKS(500));
-
-    if (wakeByPrgButton) {
-        Serial.println("Wake PRG: tare locale auto");
-        LoadCell.powerUp();
-        LoadCell.tareNoDelay();
-        tareInProgress = true;
-    }
 
     if (!initLoRa()) {
         Serial.println("ERREUR LORA");
@@ -1406,9 +1371,7 @@ void setup() {
     Serial.println("\n=== PRET ===");
     Serial.println("t=tare, c=calibrage, x=test envoi, h=aide");
     Serial.println("============================\n");
-    if (oled_working) {
-        displayMessage("PRET", "Attente...");
-    }
+    displayMessage("PRET", "Attente...");
 
     if (!LOW_POWER_MODE) {
         vTaskDelay(pdMS_TO_TICKS(2000));
