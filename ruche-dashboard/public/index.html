@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="fr">
   <head>
     <meta charset="UTF-8" />
@@ -226,6 +226,7 @@
       <div id="tabTech" class="tabpanel">
         <div class="card cmd">
           <button id="cmdTare">Tare</button>
+          <button id="cmdCalStart">Cal start</button>
           <input id="calMass" type="number" min="1" step="0.1" placeholder="Masse g" />
           <button id="cmdCal">Calibrer</button>
           <span id="cmdStatus" class="cmd-status">Commandes balance</span>
@@ -250,6 +251,8 @@
       let selectedRange = "1d";
       const allRows = [];
       let lastAck = null;
+      let pendingAckPrefix = null;
+      let pendingAckTimer = null;
 
       function mkChart(id, label, color, yMin = null, yMax = null) {
         return new Chart($(id), {
@@ -385,8 +388,30 @@
 
       function renderAck() {
         if (!lastAck || !lastAck.payload) return;
-        $("cmdStatus").textContent = `ACK ${new Date(lastAck.ts).toLocaleTimeString()} : ${lastAck.payload}`;
         $("techAck").textContent = `${new Date(lastAck.ts).toLocaleTimeString()} | ${lastAck.payload}`;
+      }
+
+      function waitForExpectedAck(prefix, timeoutMs = 15000) {
+        pendingAckPrefix = prefix;
+        if (pendingAckTimer) {
+          clearTimeout(pendingAckTimer);
+          pendingAckTimer = null;
+        }
+        pendingAckTimer = setTimeout(() => {
+          if (pendingAckPrefix === prefix) {
+            $("cmdStatus").textContent = "Aucun ACK recu (timeout)";
+            pendingAckPrefix = null;
+            pendingAckTimer = null;
+          }
+        }, timeoutMs);
+      }
+
+      function clearPendingAckWait() {
+        pendingAckPrefix = null;
+        if (pendingAckTimer) {
+          clearTimeout(pendingAckTimer);
+          pendingAckTimer = null;
+        }
       }
 
       function updateTechnical(last) {
@@ -482,6 +507,7 @@
       $("exportCsv").addEventListener("click", exportCsv);
       $("cmdTare").addEventListener("click", async () => {
         const box = $("cmdStatus");
+        clearPendingAckWait();
         if (!window.confirm("Confirmer la TARE a distance ?")) {
           box.textContent = "Tare annulee";
           return;
@@ -489,26 +515,45 @@
         box.textContent = "Envoi TARE...";
         try {
           const out = await sendCommand({ action: "tare" });
-          box.textContent = `OK: ${out.payload}`;
+          box.textContent = `Envoye: ${out.payload} | attente ACK...`;
+          waitForExpectedAck("ACK:RUCHE1:TARE:");
+        } catch (e) {
+          box.textContent = `Erreur: ${e.message}`;
+        }
+      });
+      $("cmdCalStart").addEventListener("click", async () => {
+        const box = $("cmdStatus");
+        clearPendingAckWait();
+        if (!window.confirm("Confirmer le debut de calibration a distance ?")) {
+          box.textContent = "Calibration annulee";
+          return;
+        }
+        box.textContent = "Envoi CAL_START...";
+        try {
+          const out = await sendCommand({ action: "cal_start" });
+          box.textContent = `Envoye: ${out.payload} | attente ACK...`;
+          waitForExpectedAck("ACK:RUCHE1:CAL_START:");
         } catch (e) {
           box.textContent = `Erreur: ${e.message}`;
         }
       });
       $("cmdCal").addEventListener("click", async () => {
         const box = $("cmdStatus");
+        clearPendingAckWait();
         const mass = Number($("calMass").value);
         if (!Number.isFinite(mass) || mass <= 0) {
           box.textContent = "Saisir une masse > 0";
           return;
         }
-        if (!window.confirm(`Confirmer le calibrage avec ${mass.toFixed(2)} g ?`)) {
+        if (!window.confirm(`Confirmer la masse de reference ${mass.toFixed(2)} g ?`)) {
           box.textContent = "Calibrage annule";
           return;
         }
         box.textContent = `Envoi CAL:${mass.toFixed(2)}...`;
         try {
           const out = await sendCommand({ action: "cal", mass_g: mass });
-          box.textContent = `OK: ${out.payload}`;
+          box.textContent = `Envoye: ${out.payload} | attente ACK...`;
+          waitForExpectedAck("ACK:RUCHE1:CAL:");
         } catch (e) {
           box.textContent = `Erreur: ${e.message}`;
         }
@@ -549,6 +594,15 @@
       socket.on("ack", (ack) => {
         lastAck = ack;
         renderAck();
+        const payload = String((ack && ack.payload) || "");
+        if (pendingAckPrefix && payload.startsWith(pendingAckPrefix)) {
+          if (payload.includes(":ERR")) {
+            $("cmdStatus").textContent = `ACK erreur: ${payload}`;
+          } else {
+            $("cmdStatus").textContent = `ACK OK: ${payload}`;
+          }
+          clearPendingAckWait();
+        }
       });
 
       socket.on("connect_error", () => {
@@ -560,3 +614,4 @@
     </script>
   </body>
 </html>
+

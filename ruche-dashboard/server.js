@@ -80,6 +80,8 @@ app.post("/api/command", (req, res) => {
 
   if (action === "tare") {
     payload = "TARE";
+  } else if (action === "cal_start") {
+    payload = "CAL_START";
   } else if (action === "cal") {
     const mass = Number(req.body?.mass_g);
     if (!Number.isFinite(mass) || mass <= 0) {
@@ -381,4 +383,5 @@ if (httpsEnabled) {
     console.log(`[HTTP] Redirect: http://127.0.0.1:${REDIRECT_HTTP_PORT} -> https://127.0.0.1:${HTTPS_PORT}`);
   });
 }
+
 
