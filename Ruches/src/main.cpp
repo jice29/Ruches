@@ -168,11 +168,13 @@ bool applyCalibrationDelta(float knownMass, float measuredDelta);
 
 // ===== Filtrage HX711 =====
 const uint8_t FILTER_WINDOW_SIZE = 20;
-const float EMA_ALPHA_SLOW = 0.05f;
-const float EMA_ALPHA_MED = 0.10f;
-const float EMA_ALPHA_FAST = 0.25f;
-const float FAST_TRACK_DELTA_G = 120.0f;
+const float EMA_ALPHA_SLOW = 0.10f;
+const float EMA_ALPHA_MED = 0.30f;
+const float EMA_ALPHA_FAST = 0.60f;
+const float EMA_MEDIUM_DELTA_G = 100.0f;
+const float EMA_FAST_DELTA_G = 500.0f;
 const float OUTLIER_JUMP_G = 100.0f;
+const float IMPOSSIBLE_JUMP_G = 10000.0f;
 const float DISPLAY_DEADBAND_G = 12.0f;
 const uint8_t STEP_CONFIRM_SAMPLES = 2;
 const uint8_t MEDIAN_WINDOW_SIZE = 7;
@@ -181,6 +183,7 @@ const float AUTO_ZERO_WINDOW_G = 120.0f;      // zone "balance vide" pour corrig
 const float AUTO_ZERO_MAX_STEP_G = 1.5f;      // variation max entre 2 mesures pour corriger
 const float AUTO_ZERO_ALPHA = 0.015f;         // vitesse de correction derive
 const float ZERO_LOCK_G = 8.0f;               // affichage force a 0 sous ce seuil
+const float NEGATIVE_CLAMP_G = 200.0f;        // petites valeurs negatives forcees a 0
 const float TELEMETRY_EMA_ALPHA = 0.10f;      // lissage dedie aux trames envoyees
 const float TELEMETRY_MAX_STEP_G = 120.0f;    // limite de variation par echantillon pour la telemetrie
 const float FAST_CHANGE_TRIGGER_G = 60.0f;    // envoi immediat sur variation brusque
@@ -245,6 +248,20 @@ float medianFilter(float raw) {
 }
 
 float filterWeight(float raw) {
+    // Rejette les sauts impossibles avant d'alimenter les buffers de lissage.
+    if (emaReady) {
+        float impossibleJump = fabs(raw - emaWeight);
+        if (impossibleJump > IMPOSSIBLE_JUMP_G) {
+            return emaWeight;
+        }
+    }
+
+    // Petite derive negative autour de zero: on force a zero pour eviter
+    // d'alimenter l'EMA avec un poids negatif non physique.
+    if (raw < 0.0f && raw >= -NEGATIVE_CLAMP_G) {
+        raw = 0.0f;
+    }
+
     if (emaReady) {
         float diff = fabs(raw - emaWeight);
         if (diff > OUTLIER_JUMP_G) {
@@ -282,12 +299,16 @@ float filterWeight(float raw) {
     } else {
         float delta = fabs(avg - emaWeight);
         float alpha = EMA_ALPHA_SLOW;
-        if (delta >= FAST_TRACK_DELTA_G) {
+        if (delta > EMA_FAST_DELTA_G) {
             alpha = EMA_ALPHA_FAST;
-        } else if (delta >= 40.0f) {
+        } else if (delta > EMA_MEDIUM_DELTA_G) {
             alpha = EMA_ALPHA_MED;
         }
         emaWeight = alpha * avg + (1.0f - alpha) * emaWeight;
+    }
+
+    if (emaWeight < 0.0f && emaWeight >= -NEGATIVE_CLAMP_G) {
+        emaWeight = 0.0f;
     }
 
     return emaWeight;
@@ -588,9 +609,21 @@ void saveTareOffset(long tareOffset) {
 }
 
 bool applyCalibrationDelta(float knownMass, float measuredDelta) {
+    if (measuredDelta <= 0.0f) {
+        Serial.println("Calib KO: delta invalide");
+        displayMessage("Calib KO", "Delta invalide");
+        return false;
+    }
+
     float ratio = measuredDelta / knownMass;
+    if (ratio < 0.2f || ratio > 5.0f) {
+        Serial.println("Calib KO: ratio hors limite");
+        displayMessage("Calib KO", "Ratio invalide");
+        return false;
+    }
+
     float newCal = currentCalFactor * ratio;
-    if (isnan(newCal) || isinf(newCal) || newCal == 0.0f) {
+    if (isnan(newCal) || isinf(newCal) || newCal <= 0.0f) {
         Serial.println("Calibration echouee");
         displayMessage("Calib KO", "Valeur invalide");
         return false;
