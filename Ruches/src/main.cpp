@@ -1089,9 +1089,16 @@ void taskHX711(void* parameter) {
         }
 
         if (LoadCell.update() && (now - lastRead > 200)) {
+            bool freezeAutoZero = false;
+            if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
+                freezeAutoZero = calibrationBaseReady || calibrationPending ||
+                                 (calibrationCommandWindowUntilMs != 0);
+                xSemaphoreGive(gDataMutex);
+            }
+
             float rawWeight = LoadCell.getData();
             float correctedRaw = rawWeight - softwareZeroOffset;
-            if (prevCorrectedRawReady) {
+            if (!freezeAutoZero && prevCorrectedRawReady) {
                 float d = fabs(correctedRaw - prevCorrectedRaw);
                 if (fabs(correctedRaw) <= AUTO_ZERO_WINDOW_G && d <= AUTO_ZERO_MAX_STEP_G) {
                     softwareZeroOffset += AUTO_ZERO_ALPHA * correctedRaw;
@@ -1200,9 +1207,15 @@ void taskHX711(void* parameter) {
                     applyCalibrationDelta(calibrationMassLocal, calibrationDeltaLocal)) {
                     snprintf(ack, sizeof(ack), "ACK:%s:CAL:OK:%.2f", LORA_NODE_ID, calibrationMassLocal);
                 } else {
-                    Serial.println("Calib KO: delta trop faible");
-                    displayMessage("Calib KO", "Delta trop faible");
-                    snprintf(ack, sizeof(ack), "ACK:%s:CAL:ERR", LORA_NODE_ID);
+                    if (calibrationDeltaLocal < CALIBRATION_MIN_DELTA_G) {
+                        Serial.println("Calib KO: delta trop faible");
+                        displayMessage("Calib KO", "Delta trop faible");
+                        snprintf(ack, sizeof(ack), "ACK:%s:CAL:ERR:TIMEOUT", LORA_NODE_ID);
+                    } else {
+                        Serial.println("Calib KO: facteur invalide");
+                        displayMessage("Calib KO", "Facteur invalide");
+                        snprintf(ack, sizeof(ack), "ACK:%s:CAL:ERR", LORA_NODE_ID);
+                    }
                 }
                 envoyerPaquet(ack);
             }
