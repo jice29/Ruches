@@ -38,8 +38,8 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // ===== Mode economie d'energie =====
 const bool LOW_POWER_MODE = true;
-const uint8_t LOW_POWER_WAKE_MIN = 15;         // 5, 10 ou 15 minutes
-const uint32_t LOW_POWER_SLEEP_S = (uint32_t)LOW_POWER_WAKE_MIN * 60U;
+const uint8_t LOW_POWER_WAKE_MIN = 15;         // conserve la config nominale (minutes)
+const uint32_t LOW_POWER_SLEEP_S = 10;         // DEBUG: reveil toutes les 10 secondes
 const uint32_t LOW_POWER_ACTIVE_WINDOW_MS = 12000; // fenetre de mesure avant envoi
 const bool KEEP_AWAKE_WHEN_USB_SERIAL = true;
 const uint32_t STARTUP_SETTLE_IGNORE_MS = 5000;
@@ -50,6 +50,7 @@ const float WEIGHT_EMA_ALPHA_OPT = 0.02f;      // configurable
 const float WEIGHT_TEMP_COEFF = 0.30f;         // g / degC, configurable
 const float SEND_DELTA_THRESHOLD_G = 10.0f;    // anti-envoi inutile
 const uint16_t SEND_MAX_INTERVAL_MIN = 30;     // envoi de securite
+const unsigned long DEBUG_TX_INTERVAL_MS = 2000;
 const uint8_t HX711_SAMPLE_COUNT = 30;
 const uint8_t HX711_TRIM_PERCENT = 20;
 const uint16_t HX711_WAKE_SETTLE_MS = 200;
@@ -109,6 +110,9 @@ float lastTempC = NAN;
 float lastHumPct = NAN;
 unsigned long lastDhtReadMs = 0;
 const unsigned long DHT_READ_INTERVAL_MS = 10000;
+const unsigned long DHT_RETRY_ON_FAIL_MS = 2500;
+const unsigned long DHT_WARMUP_MS = 2500;
+unsigned long dhtBeginMs = 0;
 float batteryVoltage = NAN;
 int batteryPercent = -1;
 bool batteryChargingLikely = false;
@@ -370,9 +374,10 @@ float readWeightOptimized() {
 }
 
 bool shouldSendTelemetry(float weight) {
+    if (LOW_POWER_SLEEP_S <= 10) return true; // mode debug: envoi a chaque reveil
     if (isnan(rtcLastSentWeight)) return true;
     if (fabs(weight - rtcLastSentWeight) > SEND_DELTA_THRESHOLD_G) return true;
-    if (((uint32_t)rtcCyclesSinceLastSend * (uint32_t)LOW_POWER_WAKE_MIN) >= (uint32_t)SEND_MAX_INTERVAL_MIN) return true;
+    if (((uint32_t)rtcCyclesSinceLastSend * (uint32_t)LOW_POWER_SLEEP_S) >= ((uint32_t)SEND_MAX_INTERVAL_MIN * 60U)) return true;
     return false;
 }
 
@@ -524,7 +529,9 @@ void updateDisplay() {
 
 void readDhtSensor() {
     unsigned long now = millis();
-    if (now - lastDhtReadMs < DHT_READ_INTERVAL_MS) return;
+    if ((now - dhtBeginMs) < DHT_WARMUP_MS) return;
+    unsigned long intervalMs = (isnan(lastTempC) || isnan(lastHumPct)) ? DHT_RETRY_ON_FAIL_MS : DHT_READ_INTERVAL_MS;
+    if (now - lastDhtReadMs < intervalMs) return;
     lastDhtReadMs = now;
 
     float h = dht.readHumidity();
@@ -1164,6 +1171,10 @@ void taskHX711(void* parameter) {
                     }
                     lastWeight = stableWeight;
                     pushStartupSample(stableWeight);
+                    if (LOW_POWER_MODE && !startupReady) {
+                        // En mode ultra low-power, autorise l'envoi apres 1ere mesure valide.
+                        startupReady = true;
+                    }
                     if (!startupReady && (now - bootMs) > STARTUP_SETTLE_IGNORE_MS && isStartupStable()) {
                         startupReady = true;
                         Serial.println("Startup HX711 stable");
@@ -1232,6 +1243,7 @@ void taskLoRa(void* parameter) {
     (void)parameter;
     while (true) {
         unsigned long now = millis();
+        bool usbActive = isUsbSerialActive();
 
         if (loraRxFlag) {
             loraRxFlag = false;
@@ -1261,7 +1273,11 @@ void taskLoRa(void* parameter) {
 
         if (gDataMutex != NULL && xSemaphoreTake(gDataMutex, portMAX_DELAY) == pdTRUE) {
             startupReadyLocal = startupReady;
-            if (!telemetryCycleDone && startupReady && shouldSendTelemetry(lastWeight)) {
+            bool txReady = startupReady || LOW_POWER_MODE;
+            bool oneShotCycle = LOW_POWER_MODE && !usbActive;
+            unsigned long minTxInterval = (LOW_POWER_SLEEP_S <= 10) ? DEBUG_TX_INTERVAL_MS : (unsigned long)interval;
+            bool txIntervalElapsed = (now - previousMillis) >= minTxInterval;
+            if (((!oneShotCycle) || !telemetryCycleDone) && txReady && txIntervalElapsed && shouldSendTelemetry(lastWeight)) {
                 doSend = true;
                 sendWeight = lastWeight;
                 tempLocal = lastTempC;
@@ -1269,14 +1285,14 @@ void taskLoRa(void* parameter) {
                 batteryPercentLocal = batteryPercent;
                 lastSentWeight = sendWeight;
                 lastSentWeightReady = true;
-                telemetryCycleDone = true;
+                if (oneShotCycle) telemetryCycleDone = true;
                 previousMillis = now;
             }
             xSemaphoreGive(gDataMutex);
         }
 
         if (doSend) {
-            if (!startupReadyLocal && (now - bootMs) < STARTUP_FORCE_SEND_MS) {
+            if (!LOW_POWER_MODE && !startupReadyLocal && (now - bootMs) < STARTUP_FORCE_SEND_MS) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
@@ -1297,7 +1313,7 @@ void taskLoRa(void* parameter) {
             rtcLastSentWeight = sendWeight;
             rtcCyclesSinceLastSend = 0;
 
-            if (LOW_POWER_MODE && !isUsbSerialActive()) {
+            if (LOW_POWER_MODE && !usbActive) {
                 lowPowerFrameSent = true;
                 Serial.println("Low power: trame envoyee, passage en deep sleep");
                 vTaskDelay(pdMS_TO_TICKS(50));
@@ -1305,7 +1321,7 @@ void taskLoRa(void* parameter) {
             }
         }
 
-        if (LOW_POWER_MODE && !lowPowerFrameSent && !isUsbSerialActive() && (now - bootMs) >= LOW_POWER_ACTIVE_WINDOW_MS) {
+        if (LOW_POWER_MODE && !lowPowerFrameSent && !usbActive && (now - bootMs) >= LOW_POWER_ACTIVE_WINDOW_MS) {
             // Pas de variation significative, on rend la main au deep sleep.
             Serial.println("Low power: pas de variation utile, deep sleep");
             enterDeepSleep();
@@ -1319,6 +1335,8 @@ void setup() {
     Serial.begin(115200);
     vTaskDelay(pdMS_TO_TICKS(1000));
     dht.begin();
+    dhtBeginMs = millis();
+    lastDhtReadMs = dhtBeginMs - DHT_READ_INTERVAL_MS; // autorise une lecture rapide apres warmup
     WiFi.mode(WIFI_OFF);
     pinMode(BAT_ADC_EN_PIN, OUTPUT);
     digitalWrite(BAT_ADC_EN_PIN, HIGH);
