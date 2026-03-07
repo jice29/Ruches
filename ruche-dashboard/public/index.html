@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="fr">
   <head>
     <meta charset="UTF-8" />
@@ -542,12 +542,11 @@
           return;
         }
 
-
         box.textContent = `Envoi CAL:${mass.toFixed(2)}...`;
         try {
           const out = await sendCommand({ action: "cal", mass_g: mass });
-          box.textContent = `Envoye: ${out.payload} | attente ACK...`;
-          waitForExpectedAck("ACK:RUCHE1:CAL:");
+          box.textContent = `Envoye: ${out.payload} | attente stabilisation poids puis ACK...`;
+          waitForExpectedAck("ACK:RUCHE1:CAL:", 60000);
         } catch (e) {
           box.textContent = `Erreur: ${e.message}`;
         }
@@ -608,5 +607,8 @@
     </script>
   </body>
 </html>
+
+
+
 
 
